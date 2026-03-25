@@ -80,7 +80,15 @@ export class PageHandler {
     }
 
     this._isDragging = false;
-    this._lastMousePosition = { x: 0, y: 0 };
+
+    // Camoufox: set a random default cursor position
+    let random_val = (max_val) => Math.floor(Math.random() * max_val);
+    this._defaultCursorPos = {
+      x: random_val(this._pageTarget._viewportSize?.width || 1280),
+      y: random_val(this._pageTarget._viewportSize?.height || 720),
+    };
+    this._lastMousePosition = { ...this._defaultCursorPos };
+    this._lastTrackedPos = { ...this._defaultCursorPos };
 
     this._reportedFrameIds = new Set();
     this._networkEventsForUnreportedFrameIds = new Map();
@@ -427,6 +435,14 @@ export class PageHandler {
     });
     unsubscribe();
 
+    if (ChromeUtils.camouGetBool('memorysaver', false)) {
+      ChromeUtils.camouDebug('Clearing all memory...');
+      Services.obs.notifyObservers(null, "child-gc-request");
+      Cu.forceGC();
+      Services.obs.notifyObservers(null, "child-cc-request");
+      Cu.forceCC();
+    }
+
     return {
       navigationId: sameDocumentNavigation ? null : navigationId,
     };
@@ -504,10 +520,47 @@ export class PageHandler {
       if (win.windowUtils.flushApzRepaints())
         await helper.awaitTopic('apz-repaints-flushed');
 
+      // Camoufox: helper to dispatch a single mouse event and await its ACK
+      const sendMouseEvent = async (eventType, eventX, eventY) => {
+        const singleWatcher = new EventWatcher(this._pageEventSink, [eventType], this._pendingEventWatchers);
+        const jugglerEventId = win.windowUtils.jugglerSendMouseEvent(
+          eventType,
+          eventX + boundingBox.left,
+          eventY + boundingBox.top,
+          button,
+          clickCount,
+          modifiers,
+          false /* aIgnoreRootScrollFrame */,
+          0.0 /* pressure */,
+          0 /* inputSource */,
+          true /* isDOMEventSynthesized */,
+          false /* isWidgetEventSynthesized */,
+          buttons,
+          win.windowUtils.DEFAULT_MOUSE_POINTER_ID /* pointerIdentifier */,
+          false /* disablePointerEvent */
+        );
+        await singleWatcher.ensureEvent(eventType, eventObject => eventObject.jugglerEventId === jugglerEventId);
+        await singleWatcher.dispose();
+      };
+
+      // Camoufox: humanize mouse movement with Bezier trajectory
+      if (types.length === 1 && types[0] === 'mousemove' && ChromeUtils.camouGetBool('humanize', false)) {
+        let trajectory = ChromeUtils.camouGetMouseTrajectory(this._lastTrackedPos.x, this._lastTrackedPos.y, x, y);
+        for (let i = 2; i < trajectory.length - 2; i += 2) {
+          let currentX = trajectory[i];
+          let currentY = trajectory[i + 1];
+          if (currentX < 0 || currentY < 0 || currentX > boundingBox.width || currentY > boundingBox.height)
+            continue;
+          await sendMouseEvent('mousemove', currentX, currentY);
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        return;
+      }
+
+      // Default: batch dispatch for non-humanized events
       const watcher = new EventWatcher(this._pageEventSink, types, this._pendingEventWatchers);
       const promises = [];
       for (const type of types) {
-        // This dispatches to the renderer synchronously.
         const jugglerEventId = win.windowUtils.jugglerSendMouseEvent(
           type,
           x + boundingBox.left,
@@ -547,8 +600,8 @@ export class PageHandler {
         // NOTE: since this won't go inside the renderer, there's no need to wait for ACK.
         win.windowUtils.sendMouseEvent(
           'mousemove',
-          0 /* x */,
-          0 /* y */,
+          this._defaultCursorPos.x,
+          this._defaultCursorPos.y,
           button,
           clickCount,
           modifiers,
@@ -584,6 +637,7 @@ export class PageHandler {
 
         const watcher = new EventWatcher(this._pageEventSink, ['dragstart', 'juggler-drag-finalized'], this._pendingEventWatchers);
         await sendEvents(['mousemove']);
+        this._lastTrackedPos = { x, y };
 
         // The order of events after 'mousemove' is sent:
         // 1. [dragstart] - might or might NOT be emitted

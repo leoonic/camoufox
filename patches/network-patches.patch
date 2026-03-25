@@ -49,16 +49,24 @@ index d0aebdf965..01472ec205 100644
 
    mAcceptLanguagesIsDirty = false;
 
-@@ -2098,6 +2112,10 @@ nsresult nsHttpHandler::SetAcceptLanguages() {
+@@ -2098,11 +2112,19 @@ nsresult nsHttpHandler::SetAcceptLanguages() {
 
  nsresult nsHttpHandler::SetAcceptEncodings(const char* aAcceptEncodings,
                                             bool isSecure, bool isDictionary) {
-+  if (auto value = MaskConfig::GetString("headers.Accept-Encoding")) {
-+    mHttpsAcceptEncodings.Assign(nsCString(value.value().c_str()));
-+    return NS_OK;
-+  }
    if (isDictionary) {
     mDictionaryAcceptEncodings = aAcceptEncodings;
   } else if (isSecure) {
++    if (auto value = MaskConfig::GetString("headers.Accept-Encoding")) {
++      mHttpsAcceptEncodings.Assign(nsCString(value.value().c_str()));
++    } else {
      mHttpsAcceptEncodings = aAcceptEncodings;
++    }
    } else {
++    if (auto value = MaskConfig::GetString("headers.Accept-Encoding")) {
++      mHttpAcceptEncodings.Assign(nsCString(value.value().c_str()));
++    } else {
+     mHttpAcceptEncodings = aAcceptEncodings;
++    }
+   }
+   return NS_OK;
+ }

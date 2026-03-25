@@ -495,6 +495,24 @@ def generate_context_fingerprint(
             except Exception:
                 pass
 
+        # Validate hardware coherence against the sampled WebGL renderer
+        try:
+            from camoufox.device_profiles.validator import (
+                classify_renderer, pick_thread_count, pick_resolution, pick_dpr,
+            )
+            renderer = config.get('webGl:renderer', '')
+            if renderer:
+                tier = classify_renderer(renderer)
+                config['navigator.hardwareConcurrency'] = pick_thread_count(tier)
+                w, h = pick_resolution(tier)
+                config['screen.width'] = w
+                config['screen.height'] = h
+                config['screen.colorDepth'] = 24
+                config['screen.pixelDepth'] = 24
+                config['screen.devicePixelRatio'] = pick_dpr(tier, w)
+        except ImportError:
+            pass
+
         # Build source dicts from BrowserForge config for init_values
         nav = {
             'platform': config.get('navigator.platform'),

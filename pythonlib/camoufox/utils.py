@@ -499,6 +499,21 @@ def launch_options(
         args = []
     if firefox_user_prefs is None:
         firefox_user_prefs = {}
+
+    # FF140+: re-enable MutationEvents (many anti-bot SDKs depend on them)
+    firefox_user_prefs.setdefault("dom.mutation-events.enabled", True)
+    # FF144+: allow cross-origin iframe top navigation (captcha flows)
+    firefox_user_prefs.setdefault("dom.security.framebusting_intervention.enabled", False)
+    # FF145+: disable Bounce Tracking Protection (breaks captcha/auth redirect chains)
+    firefox_user_prefs.setdefault("privacy.bounceTrackingProtection.enabled", False)
+    firefox_user_prefs.setdefault("privacy.bounceTrackingProtection.mode", 0)
+    # FF141+: disable CHIPS cookie partitioning (breaks cross-site auth flows)
+    firefox_user_prefs.setdefault("network.cookie.CHIPS.enabled", False)
+    # Accept all cookies (camoufox.cfg sets 4=partition which breaks captcha verification)
+    firefox_user_prefs.setdefault("network.cookie.cookieBehavior", 0)
+    firefox_user_prefs.setdefault("network.cookie.sameSite.laxByDefault", False)
+    firefox_user_prefs.setdefault("network.cookie.sameSite.noneRequiresSecure", False)
+
     if custom_fonts_only is None:
         custom_fonts_only = False
     if i_know_what_im_doing is None:
@@ -647,6 +662,17 @@ def launch_options(
         set_into(config, 'humanize', True)
         if isinstance(humanize, (int, float)):
             set_into(config, 'humanize:maxTime', humanize)
+
+    # Camoufox: set Chrome-like HTTP/2 fingerprint to avoid passive detection
+    if not is_domain_set(config, 'h2:'):
+        set_into(config, 'h2:headerTableSize', 65536)
+        set_into(config, 'h2:initialWindowSize', 6291456)
+        set_into(config, 'h2:maxConcurrentStreams', 1000)
+        set_into(config, 'h2:maxHeaderListSize', 262144)
+        set_into(config, 'h2:windowUpdateSize', 15663105)
+        set_into(config, 'h2:disablePriority', True)
+        set_into(config, 'h2:pseudoHeaderOrder', 'masp')
+        set_into(config, 'h2:disableTeTrailers', True)
 
     # Enable the main world context creation
     if main_world_eval:
