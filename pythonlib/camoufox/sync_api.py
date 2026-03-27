@@ -15,6 +15,7 @@ from camoufox.virtdisplay import VirtualDisplay
 
 from .exceptions import InvalidProxy
 from .fingerprints import generate_context_fingerprint
+from .pkgman import installed_verstr
 from .utils import launch_options, sync_attach_vd
 
 
@@ -155,6 +156,13 @@ def NewContext(
         geolocation: Per-context geolocation ({"latitude": float, "longitude": float}).
         **context_kwargs: Additional Playwright new_context() options.
     """
+    # Auto-detect Firefox version from installed binary if not provided
+    if not ff_version:
+        try:
+            ff_version = installed_verstr().split('.', 1)[0]
+        except Exception:
+            pass
+
     # Auto-derive WebRTC IP and timezone from proxy's exit IP when not explicitly provided
     if proxy and (not webrtc_ip or "timezone_id" not in context_kwargs):
         geo = _resolve_proxy_geo(proxy)

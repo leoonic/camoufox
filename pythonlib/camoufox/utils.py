@@ -663,15 +663,8 @@ def launch_options(
         if isinstance(humanize, (int, float)):
             set_into(config, 'humanize:maxTime', humanize)
 
-    # Camoufox: set Chrome-like HTTP/2 fingerprint to avoid passive detection
+    # Only suppress te:trailers header (Firefox-exclusive, detectable)
     if not is_domain_set(config, 'h2:'):
-        set_into(config, 'h2:headerTableSize', 65536)
-        set_into(config, 'h2:initialWindowSize', 6291456)
-        set_into(config, 'h2:maxConcurrentStreams', 1000)
-        set_into(config, 'h2:maxHeaderListSize', 262144)
-        set_into(config, 'h2:windowUpdateSize', 15663105)
-        set_into(config, 'h2:disablePriority', True)
-        set_into(config, 'h2:pseudoHeaderOrder', 'masp')
         set_into(config, 'h2:disableTeTrailers', True)
 
     # Enable the main world context creation
