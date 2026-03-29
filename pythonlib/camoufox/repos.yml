@@ -17,6 +17,10 @@ browsers:
           min: "beta.19"
           max: "1"
 
+  - repo: LeooNic/camoufox
+    name: LeooNic
+    pattern: "{name}-{version}-{build}-{os}.{arch}.zip"
+
   - repo: coryking/camoufox
     name: CoryKing
     pattern: "{name}-{version}-{build}-{os}.{arch}.zip"
