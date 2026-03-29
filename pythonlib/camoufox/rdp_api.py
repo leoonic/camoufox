@@ -347,20 +347,27 @@ class RDPPage:
         self._url = url
         self._console_started = False
 
-        await asyncio.sleep(1)
-        await asyncio.to_thread(self._refresh_target)
-
         target_state = "complete" if wait_until in ("load", "networkidle") else "interactive"
         deadline = time.time() + (timeout / 1000)
 
+        # Wait for target to stabilize after cross-process navigation
+        await asyncio.sleep(1)
+        last_console_id = None
+        stable_count = 0
         while time.time() < deadline:
+            await asyncio.to_thread(self._refresh_target)
+            if self._console_actor_id != last_console_id:
+                last_console_id = self._console_actor_id
+                stable_count = 0
+            else:
+                stable_count += 1
             try:
                 state = await self.evaluate("document.readyState")
-                if state == target_state or state == "complete":
+                if stable_count >= 2 and (state == target_state or state == "complete"):
                     return
             except Exception:
-                await asyncio.to_thread(self._refresh_target)
-            await asyncio.sleep(0.3)
+                stable_count = 0
+            await asyncio.sleep(0.5)
 
     async def reload(self, timeout: int = 30000) -> None:
         def _reload():
