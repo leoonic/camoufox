@@ -22,7 +22,6 @@ index 52f0af76ec..2a7a9ae4fc 100644
 +    return;
 +  }
 +  NS_ConvertUTF16toUTF8 utf8VarName(aVarName);
-+  printf_stderr("DEBUG: %s\n", utf8VarName.get());
 +}
 +
 +bool ChromeUtils::IsCamouDebug(GlobalObject& aGlobal) {

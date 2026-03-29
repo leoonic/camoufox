@@ -16,6 +16,7 @@ Usage:
 """
 import asyncio
 import base64
+import ctypes
 import json
 import logging
 import os
@@ -28,6 +29,62 @@ from concurrent.futures import Future
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
+
+
+# Windows Job Object for killing process trees
+_kernel32 = ctypes.windll.kernel32 if os.name == "nt" else None
+
+
+def _create_job_object():
+    """Create a Windows Job Object that kills all children when closed."""
+    if not _kernel32:
+        return None
+    import ctypes.wintypes as wt
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", wt.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wt.DWORD),
+            ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
+            ("PriorityClass", wt.DWORD),
+            ("SchedulingClass", wt.DWORD),
+        ]
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    job = _kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+    info.BasicLimitInformation.LimitFlags = 0x2000  # KILL_ON_JOB_CLOSE
+    if not _kernel32.SetInformationJobObject(
+        job, 9, ctypes.byref(info), ctypes.sizeof(info)
+    ):
+        _kernel32.CloseHandle(job)
+        return None
+    return job
 
 from geckordp.actors.addon.addons import AddonsActor
 from geckordp.actors.descriptors.tab import TabActor
@@ -225,7 +282,14 @@ class RDPPage:
             console = WebConsoleActor(self._client, console_id)
             response = console.evaluate_js_async(expression)
 
-            if response is None:
+            # geckordp returns error dict (not None) on stale actors
+            _is_error = response is None or (
+                isinstance(response, dict) and "error" in response
+            )
+            if _is_error:
+                self._client.remove_event_listener(
+                    console_id, Events.WebConsole.EVALUATION_RESULT, on_result
+                )
                 self._console_started = False
                 self._refresh_target()
                 self._ensure_console()
@@ -235,7 +299,9 @@ class RDPPage:
                 )
                 console = WebConsoleActor(self._client, console_id)
                 response = console.evaluate_js_async(expression)
-                if response is None:
+                if response is None or (
+                    isinstance(response, dict) and "error" in response
+                ):
                     return None
 
             data = fut.result(timeout=timeout)
@@ -388,6 +454,22 @@ class RDPPage:
                 f.write(data)
         return data
 
+    def on(self, event: str, callback) -> None:
+        """Register event listener (stub for Playwright compatibility).
+        Network events like 'requestfinished' are not available via RDP."""
+        if not hasattr(self, "_event_listeners"):
+            self._event_listeners = {}
+        self._event_listeners.setdefault(event, []).append(callback)
+        logger.debug(f"Event listener registered (stub): {event}")
+
+    def remove_listener(self, event: str, callback) -> None:
+        """Remove event listener (stub for Playwright compatibility)."""
+        if hasattr(self, "_event_listeners") and event in self._event_listeners:
+            try:
+                self._event_listeners[event].remove(callback)
+            except ValueError:
+                pass
+
     async def wait_for_load_state(self, state: str = "load", timeout: int = 30000) -> None:
         target = "complete" if state in ("load", "networkidle") else "interactive"
         deadline = time.time() + (timeout / 1000)
@@ -399,6 +481,182 @@ class RDPPage:
             except Exception:
                 pass
             await asyncio.sleep(0.5)
+
+    async def wait_for_selector(self, selector: str, timeout: int = 30000,
+                                 state: str = "visible") -> Optional[Dict]:
+        """Wait for an element matching selector to appear.
+        state: 'visible', 'attached', or 'hidden'.
+        Returns element rect or None on timeout."""
+        sel_escaped = selector.replace("'", "\\'")
+        deadline = time.time() + (timeout / 1000)
+        while time.time() < deadline:
+            try:
+                if state == "hidden":
+                    gone = await self.evaluate(
+                        f"document.querySelector('{sel_escaped}') === null"
+                    )
+                    if gone:
+                        return {}
+                else:
+                    js = (
+                        f"(function(){{ var el = document.querySelector('{sel_escaped}');"
+                        f"if(!el) return null;"
+                    )
+                    if state == "visible":
+                        js += (
+                            f"var r = el.getBoundingClientRect();"
+                            f"if(r.width===0 && r.height===0) return null;"
+                            f"return JSON.stringify({{x:r.x,y:r.y,w:r.width,h:r.height}});"
+                        )
+                    else:
+                        js += (
+                            f"var r = el.getBoundingClientRect();"
+                            f"return JSON.stringify({{x:r.x,y:r.y,w:r.width,h:r.height}});"
+                        )
+                    js += "})()"
+                    result = await self.evaluate(js)
+                    if result and isinstance(result, str):
+                        return json.loads(result)
+            except Exception:
+                pass
+            await asyncio.sleep(0.3)
+        return None
+
+    def locator(self, selector: str) -> "_Locator":
+        """Create a Playwright-compatible locator."""
+        return _Locator(self, selector)
+
+    async def query_selector_all(self, selector: str) -> List[Dict]:
+        """Return list of element rects matching selector."""
+        sel_escaped = selector.replace("'", "\\'")
+        result = await self.evaluate(
+            f"(function(){{ var els = document.querySelectorAll('{sel_escaped}');"
+            f"var out = [];"
+            f"for(var i=0; i<els.length; i++) {{"
+            f"  var r = els[i].getBoundingClientRect();"
+            f"  out.push({{x:r.x,y:r.y,w:r.width,h:r.height,i:i}});"
+            f"}}"
+            f"return JSON.stringify(out); }})()"
+        )
+        if result and isinstance(result, str):
+            return json.loads(result)
+        return []
+
+
+class _Locator:
+    """Playwright-compatible locator for RDPPage."""
+
+    def __init__(self, page: "RDPPage", selector: str):
+        self._page = page
+        self._selector = selector
+
+    def _to_css_and_js(self) -> str:
+        """Convert Playwright-style selector to JS find expression."""
+        sel = self._selector
+        # Handle text= and text=/regex/ selectors
+        if sel.startswith("text="):
+            text = sel[5:]
+            if text.startswith("/") and "/" in text[1:]:
+                # Regex: text=/pattern/flags
+                return (
+                    f"(function(){{ var re = new RegExp({text}); "
+                    f"var tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);"
+                    f"while(tw.nextNode()) {{ if(re.test(tw.currentNode.textContent)) "
+                    f"return tw.currentNode.parentElement; }} return null; }})()"
+                )
+            else:
+                text_escaped = text.replace("\\", "\\\\").replace("'", "\\'")
+                return (
+                    f"(function(){{ var tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);"
+                    f"while(tw.nextNode()) {{ if(tw.currentNode.textContent.includes('{text_escaped}')) "
+                    f"return tw.currentNode.parentElement; }} return null; }})()"
+                )
+        # Handle css= prefix
+        if sel.startswith("css:") or sel.startswith("css="):
+            sel = sel[4:]
+        return f"document.querySelector('{sel.replace(chr(39), chr(92) + chr(39))}')"
+
+    async def wait_for(self, state: str = "visible", timeout: int = 5000) -> None:
+        find_js = self._to_css_and_js()
+        deadline = time.time() + (timeout / 1000)
+        while time.time() < deadline:
+            try:
+                if state == "hidden":
+                    result = await self._page.evaluate(f"({find_js}) === null")
+                    if result:
+                        return
+                else:
+                    js = (
+                        f"(function(){{ var el = {find_js}; if(!el) return null; "
+                        f"var r = el.getBoundingClientRect(); "
+                    )
+                    if state == "visible":
+                        js += "if(r.width===0&&r.height===0) return null; "
+                    js += "return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height}); })()"
+                    result = await self._page.evaluate(js)
+                    if result and isinstance(result, str):
+                        return
+            except Exception:
+                pass
+            await asyncio.sleep(0.3)
+        raise TimeoutError(f"Locator '{self._selector}' not {state} within {timeout}ms")
+
+    async def click(self, timeout: int = 5000) -> None:
+        find_js = self._to_css_and_js()
+        deadline = time.time() + (timeout / 1000)
+        while time.time() < deadline:
+            try:
+                js = (
+                    f"(function(){{ var el = {find_js}; if(!el) return null; "
+                    f"var r = el.getBoundingClientRect(); "
+                    f"if(r.width===0&&r.height===0) return null; "
+                    f"return JSON.stringify({{x:r.x+r.width/2,y:r.y+r.height/2}}); }})()"
+                )
+                result = await self._page.evaluate(js)
+                if result and isinstance(result, str):
+                    pos = json.loads(result)
+                    if (self._page._bridge and self._page._bridge.is_connected
+                            and self._page._tab_id is not None):
+                        await self._page._bridge.send_command(
+                            "click", {"tabId": self._page._tab_id, "x": pos["x"], "y": pos["y"]}
+                        )
+                    else:
+                        await self._page.evaluate(f"({find_js}).click()")
+                    return
+            except Exception:
+                pass
+            await asyncio.sleep(0.3)
+        raise TimeoutError(f"Locator '{self._selector}' not clickable within {timeout}ms")
+
+    async def text_content(self) -> Optional[str]:
+        find_js = self._to_css_and_js()
+        result = await self._page.evaluate(
+            f"(function(){{ var el = {find_js}; return el ? el.textContent : null; }})()"
+        )
+        return result
+
+    async def get_attribute(self, name: str) -> Optional[str]:
+        find_js = self._to_css_and_js()
+        name_escaped = name.replace("'", "\\'")
+        result = await self._page.evaluate(
+            f"(function(){{ var el = {find_js}; return el ? el.getAttribute('{name_escaped}') : null; }})()"
+        )
+        return result
+
+    async def count(self) -> int:
+        sel = self._selector
+        if sel.startswith("text="):
+            # Can't easily count text matches, return 0 or 1
+            find_js = self._to_css_and_js()
+            result = await self._page.evaluate(f"({find_js}) !== null ? 1 : 0")
+            return result or 0
+        if sel.startswith("css:") or sel.startswith("css="):
+            sel = sel[4:]
+        sel_escaped = sel.replace("'", "\\'")
+        result = await self._page.evaluate(
+            f"document.querySelectorAll('{sel_escaped}').length"
+        )
+        return result or 0
 
 
 class _Mouse:
@@ -491,7 +749,23 @@ class RDPBrowser:
         firefox_user_prefs: Optional[Dict[str, Any]] = None,
         profile_path: Optional[str] = None,
         extension_dir: str = EXTENSION_DIR,
+        fingerprint: Optional[Dict[str, Any]] = None,
     ):
+        self._fingerprint = fingerprint
+
+        # Derive viewport, timezone, locale from fingerprint if not explicit
+        if fingerprint:
+            if not viewport:
+                ow = fingerprint.get("window.outerWidth", 1920)
+                oh = fingerprint.get("window.outerHeight", 1040)
+                viewport = {"width": ow, "height": oh}
+            if not timezone:
+                timezone = fingerprint.get("timezone")
+            if not locale:
+                lang = fingerprint.get("locale:language", "en")
+                region = fingerprint.get("locale:region", "US")
+                locale = f"{lang}-{region}"
+
         self._executable = executable_path or _get_default_binary()
         self._headless = headless
         self._proxy = proxy
@@ -504,6 +778,7 @@ class RDPBrowser:
         self._profile_path = profile_path
         self._extension_dir = extension_dir
         self._proc: Optional[subprocess.Popen] = None
+        self._job = None  # Windows Job Object for process tree cleanup
         self._client: Optional[RDPClient] = None
         self._bridge: Optional[_ExtensionBridge] = None
         self._temp_profile = False
@@ -593,6 +868,19 @@ class RDPBrowser:
             "app.update.enabled": False,
             "extensions.getAddons.showPane": False,
             "extensions.getAddons.cache.enabled": False,
+            # Anti-detection: force-detach debugger thread actor so WAF
+            # debugger traps don't fire. Current binary reads librewolf.*
+            # namespace (patch bug fixed for next build).
+            "librewolf.debugger.force_detach": True,
+            # Restore session history so back/forward works normally.
+            # camoufox.cfg defaults to 0 which is detectable.
+            "browser.sessionhistory.max_entries": 50,
+            # Enable async event dispatch so sendMouseEvent crosses
+            # Fission process boundaries to reach content.
+            "test.events.async.enabled": True,
+            # Tell the extension exactly which WS port to connect to
+            # (avoids scanning 8775-8790 which causes multi-instance conflicts).
+            "extensions.camoufox.ws_port": self._ws_port,
         }
         if self._proxy:
             parsed = urlparse(
@@ -614,7 +902,7 @@ class RDPBrowser:
                 prefs["network.proxy.ssl"] = proxy_host
                 prefs["network.proxy.ssl_port"] = proxy_port
                 prefs["network.proxy.no_proxies_on"] = "localhost, 127.0.0.1"
-        if self._locale:
+        if self._locale and not self._fingerprint:
             prefs["intl.accept_languages"] = self._locale
         _write_user_prefs(self._profile_path, prefs)
 
@@ -634,7 +922,18 @@ class RDPBrowser:
         await self._bridge.start()
 
         env = os.environ.copy()
-        if self._timezone:
+        if self._fingerprint:
+            # Full fingerprint config: strip _meta, chunk for Windows env var limit
+            fp_config = {k: v for k, v in self._fingerprint.items()
+                         if not k.startswith("_")}
+            config_str = json.dumps(fp_config)
+            chunk_size = 2047
+            for i in range(0, len(config_str), chunk_size):
+                chunk = config_str[i:i + chunk_size]
+                env[f"CAMOU_CONFIG_{(i // chunk_size) + 1}"] = chunk
+            if self._timezone:
+                env["TZ"] = self._timezone
+        elif self._timezone:
             env["TZ"] = self._timezone
             config = {"timezone": self._timezone}
             config_str = json.dumps(config)
@@ -643,8 +942,15 @@ class RDPBrowser:
         logger.info(f"Launching Camoufox RDP on port {self._rdp_port}")
         self._proc = subprocess.Popen(args, env=env)
 
+        # Assign to Job Object so all child processes are killed on close
+        if _kernel32 and self._proc:
+            self._job = _create_job_object()
+            if self._job:
+                _kernel32.AssignProcessToJobObject(self._job, int(self._proc._handle))
+
         await self._connect_rdp()
         await self._install_extension()
+        await self._wait_for_bridge()
         await self._apply_overrides()
 
     async def _connect_rdp(self, max_retries: int = 20) -> None:
@@ -690,6 +996,18 @@ class RDPBrowser:
                     await asyncio.sleep(1.0 * attempt)
                 else:
                     logger.warning(f"Extension install failed after {max_retries} attempts: {e}")
+
+    async def _wait_for_bridge(self, timeout: float = 10.0) -> None:
+        """Wait for the extension WebSocket bridge to connect."""
+        if not self._bridge:
+            return
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._bridge.is_connected:
+                logger.info("Extension bridge connected")
+                return
+            await asyncio.sleep(0.5)
+        logger.warning(f"Extension bridge not connected after {timeout}s")
 
     async def _apply_overrides(self) -> None:
         """Apply timezone via window.setTimezone() WebIDL method (Camoufox built-in)."""
@@ -780,12 +1098,22 @@ class RDPBrowser:
             self._client = None
 
         if self._proc:
-            self._proc.terminate()
+            # Kill all processes in the Job Object (browser + all children)
+            if self._job and _kernel32:
+                _kernel32.TerminateJobObject(self._job, 1)
+                _kernel32.CloseHandle(self._job)
+                self._job = None
+            else:
+                self._proc.terminate()
             try:
                 self._proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self._proc.kill()
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
             self._proc = None
+            await asyncio.sleep(0.5)
 
         if self._temp_profile:
             for d in self._temp_dirs:

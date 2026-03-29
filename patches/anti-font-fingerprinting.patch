@@ -873,10 +873,6 @@ index 1a5bdaba99..46226fc88d 100644
 +  if (!seedFromManager) {
 +    seed = 0x6D2B79F5u; // fixed constant to avoid time-based variance
 +  }
-+  printf("HarfBuzzShaper: pbid=%u seed=%u (from_manager=%d)\n",
-+         pbid,
-+         seed,
-+         seedFromManager ? 1 : 0);
 +
 +  // Generate a random float [0, 0.1] to offset the letter spacing
 +  seed = (seed * 1103515245 + 12345) & 0x7fffffff;
@@ -1023,8 +1019,6 @@ index de9a9661a1..f878bdb36c 100644
 +    aUserContextId = mUserContextId;
 +  }
 +
-+  // Log the user context id used for this text run creation
-+  printf("MakeTextRun: userContextId=%u\n", aUserContextId);
 +
    RefPtr<gfxTextRun> textRun =
 -      gfxTextRun::Create(aParams, aLength, this, aFlags, aFlags2);

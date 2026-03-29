@@ -3,8 +3,6 @@
 
 this.nativeInput = class extends ExtensionAPI {
   getAPI(context) {
-    const { Services } = globalThis;
-
     function getBrowserForTab(tabId) {
       const tab = context.extension.tabManager.get(tabId);
       if (!tab) throw new Error(`Tab ${tabId} not found`);
@@ -19,45 +17,66 @@ this.nativeInput = class extends ExtensionAPI {
       return browser.getBoundingClientRect();
     }
 
+    // Primary: synthesizeMouseEvent (no physical cursor, isTrusted=true, cross-process).
+    // Fallback: sendNativeMouseEvent (moves physical cursor but guaranteed cross-process).
+    function dispatchMouse(browser, type, contentX, contentY, opts = {}) {
+      const win = browser.ownerGlobal;
+      const rect = getBrowserRect(browser);
+      const chromeX = rect.left + contentX;
+      const chromeY = rect.top + contentY;
+
+      if (typeof win.synthesizeMouseEvent === "function") {
+        win.synthesizeMouseEvent(
+          type, chromeX, chromeY,
+          {
+            button: opts.button || 0,
+            buttons: opts.buttons || 0,
+            clickCount: opts.clickCount || 0,
+            modifiers: 0,
+            pressure: 0.0,
+            inputSource: 1,
+          },
+          {
+            isDOMEventSynthesized: false,
+            isWidgetEventSynthesized: false,
+          }
+        );
+      } else {
+        // Fallback: native OS event
+        const utils = getWindowUtils(browser);
+        const s = win.devicePixelRatio;
+        const sx = Math.round((win.mozInnerScreenX + chromeX) * s);
+        const sy = Math.round((win.mozInnerScreenY + chromeY) * s);
+        let msg;
+        if (type === "mousedown") msg = utils.NATIVE_MOUSE_MESSAGE_BUTTON_DOWN;
+        else if (type === "mouseup") msg = utils.NATIVE_MOUSE_MESSAGE_BUTTON_UP;
+        else msg = utils.NATIVE_MOUSE_MESSAGE_MOVE;
+        utils.sendNativeMouseEvent(sx, sy, msg, opts.button || 0, 0, browser);
+      }
+    }
+
     return {
       nativeInput: {
         async click(tabId, x, y, button = 0) {
           const browser = getBrowserForTab(tabId);
-          const utils = getWindowUtils(browser);
-          const rect = getBrowserRect(browser);
-          const absX = rect.left + x;
-          const absY = rect.top + y;
-
-          utils.sendMouseEventToWindow("mousemove", absX, absY, 0, 0, 0);
-          utils.sendMouseEventToWindow("mousedown", absX, absY, button, 1, 0);
-          utils.sendMouseEventToWindow("mouseup", absX, absY, button, 1, 0);
+          dispatchMouse(browser, "mousemove", x, y);
+          dispatchMouse(browser, "mousedown", x, y, { button, buttons: 1, clickCount: 1 });
+          dispatchMouse(browser, "mouseup", x, y, { button, buttons: 0, clickCount: 1 });
         },
 
         async moveTo(tabId, x, y) {
           const browser = getBrowserForTab(tabId);
-          const utils = getWindowUtils(browser);
-          const rect = getBrowserRect(browser);
-          utils.sendMouseEventToWindow(
-            "mousemove", rect.left + x, rect.top + y, 0, 0, 0
-          );
+          dispatchMouse(browser, "mousemove", x, y);
         },
 
         async mouseDown(tabId, x, y, button = 0) {
           const browser = getBrowserForTab(tabId);
-          const utils = getWindowUtils(browser);
-          const rect = getBrowserRect(browser);
-          utils.sendMouseEventToWindow(
-            "mousedown", rect.left + x, rect.top + y, button, 1, 0
-          );
+          dispatchMouse(browser, "mousedown", x, y, { button, buttons: 1, clickCount: 1 });
         },
 
         async mouseUp(tabId, x, y, button = 0) {
           const browser = getBrowserForTab(tabId);
-          const utils = getWindowUtils(browser);
-          const rect = getBrowserRect(browser);
-          utils.sendMouseEventToWindow(
-            "mouseup", rect.left + x, rect.top + y, button, 1, 0
-          );
+          dispatchMouse(browser, "mouseup", x, y, { button, buttons: 0, clickCount: 1 });
         },
 
         async scroll(tabId, x, y, deltaX, deltaY) {
@@ -67,21 +86,17 @@ this.nativeInput = class extends ExtensionAPI {
           utils.sendWheelEvent(
             rect.left + x, rect.top + y,
             deltaX, deltaY, 0,
-            0, /* DOM_DELTA_PIXEL */
-            0, 0, 0, 0
+            0, 0, 0, 0, 0
           );
         },
 
         async type(tabId, text) {
           const browser = getBrowserForTab(tabId);
           const win = browser.ownerGlobal;
-
           const tip = Cc["@mozilla.org/text-input-processor;1"]
             .createInstance(Ci.nsITextInputProcessor);
-
           const begun = tip.beginInputTransactionForTests(win);
           if (!begun) throw new Error("Failed to begin input transaction");
-
           for (const ch of text) {
             const keyEvent = new win.KeyboardEvent("keydown", { key: ch });
             tip.keydown(keyEvent);
@@ -89,16 +104,18 @@ this.nativeInput = class extends ExtensionAPI {
           }
         },
 
+        async getPort() {
+          const { Services } = globalThis;
+          return Services.prefs.getIntPref("extensions.camoufox.ws_port", 8775);
+        },
+
         async keyPress(tabId, key) {
           const browser = getBrowserForTab(tabId);
           const win = browser.ownerGlobal;
-
           const tip = Cc["@mozilla.org/text-input-processor;1"]
             .createInstance(Ci.nsITextInputProcessor);
-
           const begun = tip.beginInputTransactionForTests(win);
           if (!begun) throw new Error("Failed to begin input transaction");
-
           const keyEvent = new win.KeyboardEvent("keydown", { key: key });
           tip.keydown(keyEvent);
           tip.keyup(keyEvent);

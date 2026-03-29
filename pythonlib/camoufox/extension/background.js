@@ -12,16 +12,15 @@ let proxyConfig = null;
 let proxyCredentials = null;
 
 async function initPort() {
+  // Read port from Firefox pref (set by RDPBrowser per-instance)
   try {
-    const result = await browser.experiments.nativeInput;
+    const port = await browser.nativeInput.getPort();
+    if (port && port > 0) {
+      wsPort = port;
+      return;
+    }
   } catch (_) {}
-  // Read port from Firefox pref set by RDPBrowser
-  try {
-    const response = await fetch("http://127.0.0.1:1/__ws_port__").catch(() => null);
-  } catch (_) {}
-  // Fallback: try to read from about:config via experiment API
-  // The port is baked into user.js by RDPBrowser, so we read it via a workaround:
-  // We scan ports 8775-8790 to find the active WebSocket server
+  // Fallback: scan ports 8775-8790
   for (let port = 8775; port <= 8790; port++) {
     try {
       const testWs = new WebSocket(`ws://127.0.0.1:${port}`);

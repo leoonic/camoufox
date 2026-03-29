@@ -67,6 +67,13 @@
         ]
       },
       {
+        "name": "getPort",
+        "type": "function",
+        "async": true,
+        "parameters": [],
+        "returns": {"type": "integer"}
+      },
+      {
         "name": "keyPress",
         "type": "function",
         "async": true,
