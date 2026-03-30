@@ -89,10 +89,12 @@ def _create_job_object():
 from geckordp.actors.addon.addons import AddonsActor
 from geckordp.actors.descriptors.tab import TabActor
 from geckordp.actors.events import Events
+from geckordp.actors.resources import Resources
 from geckordp.actors.root import RootActor
 from geckordp.actors.screenshot import ScreenshotActor
 from geckordp.actors.string import StringActor
 from geckordp.actors.targets.window_global import WindowGlobalActor
+from geckordp.actors.watcher import WatcherActor
 from geckordp.actors.web_console import WebConsoleActor
 from geckordp.rdp_client import RDPClient
 
@@ -339,27 +341,53 @@ class RDPPage:
         return self._url
 
     async def goto(self, url: str, wait_until: str = "load", timeout: int = 30000) -> None:
-        def _nav():
-            wg = WindowGlobalActor(self._client, self._target_actor_id)
-            wg.navigate_to(url)
+        target_event = "dom-complete" if wait_until in ("load", "networkidle") else "dom-interactive"
+        load_done = asyncio.Event()
 
-        await asyncio.to_thread(_nav)
-        self._url = url
-        self._console_started = False
+        def _on_resource(data):
+            for item in data.get("array", data.get("resources", [data])):
+                if isinstance(item, dict) and item.get("resourceType") == "document-event":
+                    name = item.get("name", "")
+                    if name == "dom-complete" or (target_event == "dom-interactive" and name == "dom-interactive"):
+                        load_done.set()
 
-        target_state = "complete" if wait_until in ("load", "networkidle") else "interactive"
-        deadline = time.time() + (timeout / 1000)
+        # Setup watcher for document events
+        tab = TabActor(self._client, self._tab_actor_id)
+        watcher_ctx = tab.get_watcher()
+        watcher = WatcherActor(self._client, watcher_ctx["actor"])
+        watcher.watch_resources([Resources.DOCUMENT_EVENT])
+        self._client.add_event_listener(
+            watcher_ctx["actor"],
+            Events.Watcher.RESOURCES_AVAILABLE_ARRAY,
+            _on_resource,
+        )
 
-        await asyncio.sleep(0.5)
-        while time.time() < deadline:
-            await asyncio.to_thread(self._refresh_target)
+        try:
+            def _nav():
+                wg = WindowGlobalActor(self._client, self._target_actor_id)
+                wg.navigate_to(url)
+
+            await asyncio.to_thread(_nav)
+            self._url = url
+            self._console_started = False
+
             try:
-                state = await self.evaluate("document.readyState")
-                if state == target_state or state == "complete":
-                    return
+                await asyncio.wait_for(load_done.wait(), timeout=timeout / 1000)
+            except asyncio.TimeoutError:
+                pass
+        finally:
+            self._client.remove_event_listener(
+                watcher_ctx["actor"],
+                Events.Watcher.RESOURCES_AVAILABLE_ARRAY,
+                _on_resource,
+            )
+            try:
+                watcher.unwatch_resources([Resources.DOCUMENT_EVENT])
             except Exception:
                 pass
-            await asyncio.sleep(0.3)
+
+        # Refresh target after navigation (cross-process)
+        await asyncio.to_thread(self._refresh_target)
 
     async def reload(self, timeout: int = 30000) -> None:
         def _reload():
