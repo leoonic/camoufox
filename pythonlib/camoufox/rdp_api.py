@@ -89,6 +89,7 @@ def _create_job_object():
 from geckordp.actors.addon.addons import AddonsActor
 from geckordp.actors.descriptors.tab import TabActor
 from geckordp.actors.events import Events
+from geckordp.actors.memory import MemoryActor
 from geckordp.actors.resources import Resources
 from geckordp.actors.root import RootActor
 from geckordp.actors.screenshot import ScreenshotActor
@@ -99,6 +100,7 @@ from geckordp.actors.web_console import WebConsoleActor
 from geckordp.rdp_client import RDPClient
 
 logger = logging.getLogger(__name__)
+logging.getLogger("geckordp").setLevel(logging.CRITICAL)
 
 EXTENSION_DIR = str(Path(__file__).parent / "extension")
 DEFAULT_RDP_PORT = 6000
@@ -244,8 +246,77 @@ class RDPPage:
         self._tab_id = tab_id
         self._url = ""
         self._console_started = False
+        self._target_ver = 0
+        self._watcher_id = None
         self.mouse = _Mouse(self)
         self.keyboard = _Keyboard(self)
+
+    async def _idle_mouse_loop(self):
+        """Subtle micro-movements while waiting, mimicking human idle behavior."""
+        import random as _r
+        try:
+            while True:
+                await asyncio.sleep(_r.uniform(0.4, 1.5))
+                dx = _r.gauss(0, 15)
+                dy = _r.gauss(0, 10)
+                nx = max(50, min(self.mouse._x + dx, 1800))
+                ny = max(50, min(self.mouse._y + dy, 900))
+                try:
+                    await self.mouse._raw_move(nx, ny)
+                    self.mouse._x = nx
+                    self.mouse._y = ny
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            pass
+
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def _with_idle_mouse(self):
+        """Run idle mouse movements in background during a wait."""
+        task = asyncio.create_task(self._idle_mouse_loop())
+        try:
+            yield
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    def _start_persistent_watcher(self):
+        """Set up a tab-level watcher that auto-updates actors on any
+        navigation (goto, click, JS redirect, etc.)."""
+        tab = TabActor(self._client, self._tab_actor_id)
+        watcher_ctx = tab.get_watcher()
+        self._watcher_id = watcher_ctx["actor"]
+        watcher = WatcherActor(self._client, self._watcher_id)
+        watcher.watch_targets(WatcherActor.Targets.FRAME)
+
+        def _on_target(data):
+            t = data.get("target", {})
+            if t.get("isTopLevelTarget"):
+                new_actor = t.get("actor", "")
+                new_console = t.get("consoleActor", "")
+                if new_console and new_console != self._console_actor_id:
+                    self._console_actor_id = new_console
+                    self._console_started = False
+                if new_actor:
+                    self._target_actor_id = new_actor
+                bc = t.get("browsingContextID")
+                if bc is not None:
+                    self._browsing_context_id = bc
+                new_url = t.get("url", "")
+                if new_url and new_url.startswith("http"):
+                    self._url = new_url
+                self._target_ver += 1
+                logger.debug(f"Persistent watcher: target updated v{self._target_ver} -> {new_console}")
+
+        self._client.add_event_listener(
+            self._watcher_id, Events.Watcher.TARGET_AVAILABLE_FORM, _on_target
+        )
+        self._persistent_target_cb = _on_target
 
     def _refresh_target(self):
         tab = TabActor(self._client, self._tab_actor_id)
@@ -332,6 +403,8 @@ class RDPPage:
 
     @property
     def url(self) -> str:
+        # Live evaluate for backward compat (CAPTCHA loops rely on fresh value).
+        # Events also update _url during goto/reload for faster access.
         try:
             result = self._eval_sync("window.location.href")
             if isinstance(result, str):
@@ -340,69 +413,206 @@ class RDPPage:
             pass
         return self._url
 
+    @property
+    def url_cached(self) -> str:
+        """Return cached URL (updated by goto/reload events). Zero round-trips."""
+        return self._url
+
+    async def url_fresh(self) -> str:
+        """Async explicit evaluate for exact URL."""
+        try:
+            result = await self.evaluate("window.location.href")
+            if isinstance(result, str):
+                self._url = result
+        except Exception:
+            pass
+        return self._url
+
     async def goto(self, url: str, wait_until: str = "load", timeout: int = 30000) -> None:
-        # Listen for TARGET_AVAILABLE_FORM to know when cross-process nav completes
-        target_ready = asyncio.Event()
-        tab = TabActor(self._client, self._tab_actor_id)
-        watcher_ctx = tab.get_watcher()
-        watcher_id = watcher_ctx["actor"]
+        loop = asyncio.get_running_loop()
+        load_done = asyncio.Event()
+        deadline = time.time() + (timeout / 1000)
+        console_listeners: list = []
 
-        def _on_target(data):
-            target = data.get("target", {})
-            if target.get("isTopLevelTarget") and target.get("url", "").startswith("http"):
-                target_ready.set()
+        goal = "dom-complete" if wait_until in ("load", "networkidle") else "dom-interactive"
 
-        self._client.add_event_listener(
-            watcher_id, Events.Watcher.TARGET_AVAILABLE_FORM, _on_target
-        )
+        def _on_doc_event(data):
+            logger.debug(f"goto DOCUMENT_EVENT: {data}")
+            name = data.get("name", "")
+            if name == goal or name == "dom-complete":
+                evt_url = data.get("url", "")
+                if evt_url:
+                    self._url = evt_url
+                loop.call_soon_threadsafe(load_done.set)
+
+        def _attach_console_listener(console_id):
+            WebConsoleActor(self._client, console_id).start_listeners(
+                [WebConsoleActor.Listeners.DOCUMENT_EVENTS]
+            )
+            self._client.add_event_listener(
+                console_id, Events.WebConsole.DOCUMENT_EVENT, _on_doc_event
+            )
+            console_listeners.append(console_id)
+
+        # Listen on current console for same-origin nav events
+        await asyncio.to_thread(lambda: _attach_console_listener(self._console_actor_id))
+        self._console_started = True
 
         try:
-            def _nav():
-                wg = WindowGlobalActor(self._client, self._target_actor_id)
-                wg.navigate_to(url)
+            # Snapshot target version before navigating
+            ver_before = self._target_ver
 
-            await asyncio.to_thread(_nav)
+            await asyncio.to_thread(
+                lambda: WindowGlobalActor(self._client, self._target_actor_id)
+                .navigate_to(url)
+            )
             self._url = url
             self._console_started = False
 
-            # Wait for new target (cross-process nav), max 5s
+            last_target_ver = ver_before
+
+            async with self._with_idle_mouse():
+              while time.time() < deadline:
+                if load_done.is_set():
+                    return
+
+                # Persistent watcher updated the target (cross-process nav)
+                if self._target_ver > last_target_ver:
+                    last_target_ver = self._target_ver
+                    await asyncio.to_thread(
+                        lambda: _attach_console_listener(self._console_actor_id)
+                    )
+                    self._console_started = True
+
+                    if load_done.is_set():
+                        return
+                    try:
+                        state = await self.evaluate("document.readyState")
+                        if state == "complete" or (
+                            goal == "dom-interactive"
+                            and state in ("interactive", "complete")
+                        ):
+                            return
+                    except Exception:
+                        pass
+                    continue
+
+                # Wait for doc event, with readyState fallback every 1s
+                remaining = max(0.1, deadline - time.time())
+                try:
+                    await asyncio.wait_for(load_done.wait(), timeout=min(1.0, remaining))
+                    return
+                except asyncio.TimeoutError:
+                    try:
+                        state = await self.evaluate("document.readyState")
+                        if state == "complete" or (
+                            goal == "dom-interactive"
+                            and state in ("interactive", "complete")
+                        ):
+                            return
+                    except Exception:
+                        pass
+        finally:
+            for cid in console_listeners:
+                try:
+                    self._client.remove_event_listener(
+                        cid, Events.WebConsole.DOCUMENT_EVENT, _on_doc_event
+                    )
+                except Exception:
+                    pass
+
+        # Post-navigation: reposition cursor and drift naturally
+        try:
+            import random as _r
+            await self.mouse._raw_move(self.mouse._x, self.mouse._y)
+            drift_x = self.mouse._x + _r.uniform(-80, 80)
+            drift_y = self.mouse._y + _r.uniform(-60, 60)
+            drift_x = max(50, min(drift_x, 1800))
+            drift_y = max(50, min(drift_y, 900))
+            await self.mouse.move_smooth(drift_x, drift_y)
+        except Exception:
+            pass
+
+    async def _wait_for_doc_event(
+        self, goal: str = "dom-complete", timeout_s: float = 30.0
+    ) -> None:
+        """Wait for a WebConsoleActor DOCUMENT_EVENT matching *goal*.
+        Used by reload() and wait_for_load_state() where no cross-process
+        nav is expected so we only listen on the current console."""
+        loop = asyncio.get_running_loop()
+        done = asyncio.Event()
+        console_id = self._console_actor_id
+
+        def _on_evt(data):
+            name = data.get("name", "")
+            if name == goal or name == "dom-complete":
+                evt_url = data.get("url", "")
+                if evt_url:
+                    self._url = evt_url
+                loop.call_soon_threadsafe(done.set)
+
+        await asyncio.to_thread(
+            lambda: WebConsoleActor(self._client, console_id)
+            .start_listeners([WebConsoleActor.Listeners.DOCUMENT_EVENTS])
+        )
+        self._console_started = True
+        self._client.add_event_listener(
+            console_id, Events.WebConsole.DOCUMENT_EVENT, _on_evt
+        )
+        try:
+            async with self._with_idle_mouse():
+                await asyncio.wait_for(done.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            pass
+        finally:
             try:
-                await asyncio.wait_for(target_ready.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
+                self._client.remove_event_listener(
+                    console_id, Events.WebConsole.DOCUMENT_EVENT, _on_evt
+                )
+            except Exception:
                 pass
 
-            # Refresh to get the new actor IDs
-            await asyncio.to_thread(self._refresh_target)
-
-            # Now poll readyState with the correct actor
-            target_state = "complete" if wait_until in ("load", "networkidle") else "interactive"
-            deadline = time.time() + (timeout / 1000)
-            while time.time() < deadline:
-                try:
-                    state = await self.evaluate("document.readyState")
-                    if state == target_state or state == "complete":
-                        return
-                except Exception:
-                    await asyncio.to_thread(self._refresh_target)
-                await asyncio.sleep(0.3)
-        finally:
-            self._client.remove_event_listener(
-                watcher_id, Events.Watcher.TARGET_AVAILABLE_FORM, _on_target
-            )
-
     async def reload(self, timeout: int = 30000) -> None:
-        def _reload():
-            wg = WindowGlobalActor(self._client, self._target_actor_id)
-            wg.reload()
+        loop = asyncio.get_running_loop()
+        goal = "dom-complete"
+        timeout_s = timeout / 1000
 
-        await asyncio.to_thread(_reload)
-        deadline = time.time() + (timeout / 1000)
-        while time.time() < deadline:
-            await asyncio.sleep(0.5)
+        # Start doc event listener BEFORE triggering reload
+        done = asyncio.Event()
+        console_id = self._console_actor_id
+
+        def _on_evt(data):
+            name = data.get("name", "")
+            if name == goal or name == "dom-complete":
+                evt_url = data.get("url", "")
+                if evt_url:
+                    self._url = evt_url
+                loop.call_soon_threadsafe(done.set)
+
+        await asyncio.to_thread(
+            lambda: WebConsoleActor(self._client, console_id)
+            .start_listeners([WebConsoleActor.Listeners.DOCUMENT_EVENTS])
+        )
+        self._console_started = True
+        self._client.add_event_listener(
+            console_id, Events.WebConsole.DOCUMENT_EVENT, _on_evt
+        )
+
+        try:
+            await asyncio.to_thread(
+                lambda: WindowGlobalActor(self._client, self._target_actor_id).reload()
+            )
+            self._console_started = False
+
+            async with self._with_idle_mouse():
+                await asyncio.wait_for(done.wait(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            pass
+        finally:
             try:
-                state = await self.evaluate("document.readyState")
-                if state == "complete":
-                    return
+                self._client.remove_event_listener(
+                    console_id, Events.WebConsole.DOCUMENT_EVENT, _on_evt
+                )
             except Exception:
                 pass
 
@@ -410,7 +620,34 @@ class RDPPage:
         return await self.evaluate("document.documentElement.outerHTML") or ""
 
     async def evaluate(self, expression: str) -> Any:
-        return await asyncio.to_thread(self._eval_sync, expression)
+        expr = expression.strip()
+        auto_called = False
+        # Playwright compat: auto-call arrow/function expressions
+        if (
+            expr.startswith("() =>")
+            or expr.startswith("async () =>")
+            or expr.startswith("function")
+        ) and not expr.endswith("()"):
+            expr = f"({expr})()"
+            auto_called = True
+
+        # For auto-called functions, wrap to serialize object/array results
+        # (geckordp returns RDP grips for non-primitives, not actual values)
+        if auto_called:
+            expr = (
+                f"(function(){{var __r=({expr});"
+                f"return typeof __r==='object'&&__r!==null?JSON.stringify(__r):__r}})()"
+            )
+
+        result = await asyncio.to_thread(self._eval_sync, expr)
+
+        # Parse stringified objects/arrays back to Python
+        if auto_called and isinstance(result, str):
+            try:
+                return json.loads(result)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return result
 
     async def query_selector(self, selector: str) -> Optional[Dict]:
         result = await self.evaluate(
@@ -429,13 +666,7 @@ class RDPPage:
             raise ValueError(f"Element not found: {selector}")
         x = rect["x"] + rect["w"] / 2
         y = rect["y"] + rect["h"] / 2
-
-        if self._bridge and self._bridge.is_connected and self._tab_id is not None:
-            await self._bridge.send_command("click", {"tabId": self._tab_id, "x": x, "y": y})
-        else:
-            await self.evaluate(
-                f"document.querySelector('{selector}').click()"
-            )
+        await self.mouse.click_smooth(x, y, target_width=rect.get("w", 50))
 
     async def fill(self, selector: str, text: str) -> None:
         await self.click(selector)
@@ -499,55 +730,214 @@ class RDPPage:
                 pass
 
     async def wait_for_load_state(self, state: str = "load", timeout: int = 30000) -> None:
+        # Quick check: already at target state?
         target = "complete" if state in ("load", "networkidle") else "interactive"
-        deadline = time.time() + (timeout / 1000)
-        while time.time() < deadline:
+        try:
+            current = await self.evaluate("document.readyState")
+            if current == target or current == "complete":
+                return
+        except Exception:
+            pass
+        goal = "dom-complete" if state in ("load", "networkidle") else "dom-interactive"
+        await self._wait_for_doc_event(goal=goal, timeout_s=timeout / 1000)
+
+    def _get_memory_actor_id(self) -> str:
+        tab = TabActor(self._client, self._tab_actor_id)
+        target = tab.get_target()
+        return target.get("memoryActor", "")
+
+    async def force_gc(self) -> None:
+        """Force garbage + cycle collection on the current tab."""
+        def _gc():
+            actor_id = self._get_memory_actor_id()
+            if not actor_id:
+                return
+            mem = MemoryActor(self._client, actor_id)
+            mem.attach()
+            mem.force_garbage_collection()
+            mem.force_cycle_collection()
+            mem.detach()
+        await asyncio.to_thread(_gc)
+
+    async def memory_usage(self) -> Optional[Dict]:
+        """Return memory measurement for the current tab."""
+        def _measure():
+            actor_id = self._get_memory_actor_id()
+            if not actor_id:
+                return None
+            mem = MemoryActor(self._client, actor_id)
+            mem.attach()
+            result = mem.measure()
+            mem.detach()
+            return result
+        return await asyncio.to_thread(_measure)
+
+    async def wait_for_network_idle(
+        self, idle_ms: int = 500, timeout: int = 30000
+    ) -> None:
+        """Wait until no network requests are pending for *idle_ms* ms.
+        Uses WatcherActor NETWORK_EVENT resource tracking."""
+        loop = asyncio.get_running_loop()
+        idle_event = asyncio.Event()
+        pending: set = set()
+        timer_handle: list = [None]
+
+        def _reschedule():
+            if timer_handle[0]:
+                timer_handle[0].cancel()
+                timer_handle[0] = None
+            if not pending:
+                timer_handle[0] = loop.call_later(
+                    idle_ms / 1000, idle_event.set
+                )
+
+        def _on_available(data):
+            actors = [
+                item.get("actor", "")
+                for item in data.get("array", [])
+                if isinstance(item, dict)
+                and item.get("resourceType") == "network-event"
+                and item.get("actor")
+            ]
+            if actors:
+
+                def _add():
+                    pending.update(actors)
+                    _reschedule()
+
+                loop.call_soon_threadsafe(_add)
+
+        def _on_updated(data):
+            actors = [
+                item.get("actor", "")
+                for item in data.get("array", [])
+                if isinstance(item, dict)
+                and item.get("resourceType") == "network-event"
+                and item.get("actor")
+            ]
+            if actors:
+
+                def _remove():
+                    for a in actors:
+                        pending.discard(a)
+                    _reschedule()
+
+                loop.call_soon_threadsafe(_remove)
+
+        tab = TabActor(self._client, self._tab_actor_id)
+        watcher_ctx = tab.get_watcher()
+        watcher_id = watcher_ctx["actor"]
+
+        def _setup_watcher():
+            w = WatcherActor(self._client, watcher_id)
+            w.watch_targets(WatcherActor.Targets.FRAME)
+            w.watch_resources([Resources.NETWORK_EVENT])
+
+        await asyncio.to_thread(_setup_watcher)
+
+        self._client.add_event_listener(
+            watcher_id, Events.Watcher.RESOURCES_AVAILABLE_ARRAY, _on_available
+        )
+        self._client.add_event_listener(
+            watcher_id, Events.Watcher.RESOURCES_UPDATED_ARRAY, _on_updated
+        )
+
+        # If network is already idle, start timer immediately
+        _reschedule()
+
+        try:
+            async with self._with_idle_mouse():
+                await asyncio.wait_for(idle_event.wait(), timeout=timeout / 1000)
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            if timer_handle[0]:
+                timer_handle[0].cancel()
             try:
-                current = await self.evaluate("document.readyState")
-                if current == target or current == "complete":
-                    return
+                self._client.remove_event_listener(
+                    watcher_id,
+                    Events.Watcher.RESOURCES_AVAILABLE_ARRAY,
+                    _on_available,
+                )
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
+            try:
+                self._client.remove_event_listener(
+                    watcher_id,
+                    Events.Watcher.RESOURCES_UPDATED_ARRAY,
+                    _on_updated,
+                )
+            except Exception:
+                pass
 
     async def wait_for_selector(self, selector: str, timeout: int = 30000,
                                  state: str = "visible") -> Optional[Dict]:
-        """Wait for an element matching selector to appear.
+        """Wait for an element matching selector to appear/hide.
+        Uses MutationObserver + lightweight global-variable poll.
         state: 'visible', 'attached', or 'hidden'.
         Returns element rect or None on timeout."""
         sel_escaped = selector.replace("'", "\\'")
+
+        # Generate unique key for this wait
+        wfs_key = f"__wfs_{id(self)}_{int(time.time()*1000) % 100000}"
+
+        if state == "hidden":
+            setup_js = (
+                f"(function(){{"
+                f"  if (!document.querySelector('{sel_escaped}')) {{ window['{wfs_key}']='ok'; return '{wfs_key}'; }}"
+                f"  var obs = new MutationObserver(function(){{"
+                f"    if (!document.querySelector('{sel_escaped}')) {{ obs.disconnect(); window['{wfs_key}']='ok'; }}"
+                f"  }});"
+                f"  obs.observe(document.body||document.documentElement,"
+                f"    {{childList:true,subtree:true,attributes:true}});"
+                f"  setTimeout(function(){{ obs.disconnect(); if(!window['{wfs_key}']) window['{wfs_key}']='timeout'; }},{timeout});"
+                f"  return '{wfs_key}';"
+                f"}})()"
+            )
+        else:
+            vis_check = "if(r.width===0&&r.height===0) return null;" if state == "visible" else ""
+            setup_js = (
+                f"(function(){{"
+                f"  function chk(){{"
+                f"    var el=document.querySelector('{sel_escaped}');"
+                f"    if(!el) return null;"
+                f"    var r=el.getBoundingClientRect(); {vis_check}"
+                f"    return JSON.stringify({{x:r.x,y:r.y,w:r.width,h:r.height}});"
+                f"  }}"
+                f"  var hit=chk(); if(hit){{ window['{wfs_key}']=hit; return '{wfs_key}'; }}"
+                f"  var obs=new MutationObserver(function(){{"
+                f"    var hit=chk(); if(hit){{ obs.disconnect(); window['{wfs_key}']=hit; }}"
+                f"  }});"
+                f"  obs.observe(document.body||document.documentElement,"
+                f"    {{childList:true,subtree:true,attributes:true}});"
+                f"  setTimeout(function(){{ obs.disconnect(); if(!window['{wfs_key}']) window['{wfs_key}']='timeout'; }},{timeout});"
+                f"  return '{wfs_key}';"
+                f"}})()"
+            )
+
+        try:
+            await self.evaluate(setup_js)
+        except Exception:
+            return None
+
+        # Poll the global variable (very cheap: single variable read)
         deadline = time.time() + (timeout / 1000)
         while time.time() < deadline:
             try:
-                if state == "hidden":
-                    gone = await self.evaluate(
-                        f"document.querySelector('{sel_escaped}') === null"
-                    )
-                    if gone:
+                val = await self.evaluate(f"window['{wfs_key}']")
+                if val and val != "null":
+                    # Cleanup
+                    await self.evaluate(f"delete window['{wfs_key}']")
+                    if val == "timeout":
+                        return None
+                    if val == "ok":
                         return {}
-                else:
-                    js = (
-                        f"(function(){{ var el = document.querySelector('{sel_escaped}');"
-                        f"if(!el) return null;"
-                    )
-                    if state == "visible":
-                        js += (
-                            f"var r = el.getBoundingClientRect();"
-                            f"if(r.width===0 && r.height===0) return null;"
-                            f"return JSON.stringify({{x:r.x,y:r.y,w:r.width,h:r.height}});"
-                        )
-                    else:
-                        js += (
-                            f"var r = el.getBoundingClientRect();"
-                            f"return JSON.stringify({{x:r.x,y:r.y,w:r.width,h:r.height}});"
-                        )
-                    js += "})()"
-                    result = await self.evaluate(js)
-                    if result and isinstance(result, str):
-                        return json.loads(result)
+                    if isinstance(val, str):
+                        return json.loads(val)
+                    return val
             except Exception:
                 pass
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.1)
         return None
 
     def locator(self, selector: str) -> "_Locator":
@@ -606,27 +996,50 @@ class _Locator:
 
     async def wait_for(self, state: str = "visible", timeout: int = 5000) -> None:
         find_js = self._to_css_and_js()
+        wfs_key = f"__wfl_{id(self)}_{int(time.time()*1000) % 100000}"
+
+        if state == "hidden":
+            setup_js = (
+                f"(function(){{"
+                f"  if (({find_js}) === null) {{ window['{wfs_key}']='ok'; return; }}"
+                f"  var obs = new MutationObserver(function(){{"
+                f"    if (({find_js}) === null) {{ obs.disconnect(); window['{wfs_key}']='ok'; }}"
+                f"  }});"
+                f"  obs.observe(document.body||document.documentElement,"
+                f"    {{childList:true,subtree:true,attributes:true}});"
+                f"  setTimeout(function(){{ obs.disconnect(); if(!window['{wfs_key}']) window['{wfs_key}']='timeout'; }},{timeout});"
+                f"}})()"
+            )
+        else:
+            vis = "if(r.width===0&&r.height===0) return null; " if state == "visible" else ""
+            setup_js = (
+                f"(function(){{"
+                f"  function chk(){{"
+                f"    var el={find_js}; if(!el) return null;"
+                f"    var r=el.getBoundingClientRect(); {vis}"
+                f"    return JSON.stringify({{x:r.x,y:r.y,w:r.width,h:r.height}});"
+                f"  }}"
+                f"  var hit=chk(); if(hit){{ window['{wfs_key}']=hit; return; }}"
+                f"  var obs=new MutationObserver(function(){{"
+                f"    var hit=chk(); if(hit){{ obs.disconnect(); window['{wfs_key}']=hit; }}"
+                f"  }});"
+                f"  obs.observe(document.body||document.documentElement,"
+                f"    {{childList:true,subtree:true,attributes:true}});"
+                f"  setTimeout(function(){{ obs.disconnect(); if(!window['{wfs_key}']) window['{wfs_key}']='timeout'; }},{timeout});"
+                f"}})()"
+            )
+
+        await self._page.evaluate(setup_js)
+
         deadline = time.time() + (timeout / 1000)
         while time.time() < deadline:
-            try:
-                if state == "hidden":
-                    result = await self._page.evaluate(f"({find_js}) === null")
-                    if result:
-                        return
-                else:
-                    js = (
-                        f"(function(){{ var el = {find_js}; if(!el) return null; "
-                        f"var r = el.getBoundingClientRect(); "
-                    )
-                    if state == "visible":
-                        js += "if(r.width===0&&r.height===0) return null; "
-                    js += "return JSON.stringify({x:r.x,y:r.y,w:r.width,h:r.height}); })()"
-                    result = await self._page.evaluate(js)
-                    if result and isinstance(result, str):
-                        return
-            except Exception:
-                pass
-            await asyncio.sleep(0.3)
+            val = await self._page.evaluate(f"window['{wfs_key}']")
+            if val and val != "null":
+                await self._page.evaluate(f"delete window['{wfs_key}']")
+                if val == "timeout":
+                    raise TimeoutError(f"Locator '{self._selector}' not {state} within {timeout}ms")
+                return
+            await asyncio.sleep(0.1)
         raise TimeoutError(f"Locator '{self._selector}' not {state} within {timeout}ms")
 
     async def click(self, timeout: int = 5000) -> None:
@@ -638,18 +1051,14 @@ class _Locator:
                     f"(function(){{ var el = {find_js}; if(!el) return null; "
                     f"var r = el.getBoundingClientRect(); "
                     f"if(r.width===0&&r.height===0) return null; "
-                    f"return JSON.stringify({{x:r.x+r.width/2,y:r.y+r.height/2}}); }})()"
+                    f"return JSON.stringify({{x:r.x+r.width/2,y:r.y+r.height/2,w:r.width}}); }})()"
                 )
                 result = await self._page.evaluate(js)
                 if result and isinstance(result, str):
                     pos = json.loads(result)
-                    if (self._page._bridge and self._page._bridge.is_connected
-                            and self._page._tab_id is not None):
-                        await self._page._bridge.send_command(
-                            "click", {"tabId": self._page._tab_id, "x": pos["x"], "y": pos["y"]}
-                        )
-                    else:
-                        await self._page.evaluate(f"({find_js}).click()")
+                    await self._page.mouse.click_smooth(
+                        pos["x"], pos["y"], target_width=pos.get("w", 50)
+                    )
                     return
             except Exception:
                 pass
@@ -687,9 +1096,112 @@ class _Locator:
         return result or 0
 
 
+def _bezier_point(t: float, p0, p1, p2, p3):
+    u = 1 - t
+    return (
+        u*u*u * p0[0] + 3*u*u*t * p1[0] + 3*u*t*t * p2[0] + t*t*t * p3[0],
+        u*u*u * p0[1] + 3*u*u*t * p1[1] + 3*u*t*t * p2[1] + t*t*t * p3[1],
+    )
+
+
+def _generate_control_points(sx, sy, ex, ey):
+    """Generate 2 control points perpendicular to the path (ghost-cursor style)."""
+    import random as _r, math as _m
+    dx, dy = ex - sx, ey - sy
+    dist = _m.sqrt(dx*dx + dy*dy) or 1.0
+    spread = max(2.0, min(200.0, dist * 0.5))
+    # Perpendicular unit vector
+    px, py = -dy / dist, dx / dist
+    # Both control points deviate to the same side (more natural)
+    side = _r.choice([-1, 1])
+    # Control point at ~25% of path
+    off1 = side * _r.uniform(spread * 0.05, spread * 0.1)
+    c1 = (sx + dx * 0.25 + px * off1, sy + dy * 0.25 + py * off1)
+    # Control point at ~75% of path
+    off2 = side * _r.uniform(spread * 0.05, spread * 0.1)
+    c2 = (sx + dx * 0.75 + px * off2, sy + dy * 0.75 + py * off2)
+    return c1, c2
+
+
+def _fitts_time(distance: float, width: float = 50.0) -> float:
+    """Fitts' Law: movement time based on distance and target width."""
+    import math as _m
+    if distance < 1:
+        return 0.05
+    idx = _m.log2(distance / width + 1)
+    return 0.1 + idx * 0.08
+
+
+def _generate_path(sx, sy, ex, ey, target_width=50.0):
+    """Generate a human-like Bezier path with Fitts' Law timing."""
+    import math as _m, random as _r
+    dist = _m.sqrt((ex - sx)**2 + (ey - sy)**2)
+    if dist < 1:
+        return [(ex, ey, 0.01)]
+
+    c1, c2 = _generate_control_points(sx, sy, ex, ey)
+    p0, p3 = (sx, sy), (ex, ey)
+
+    # Step count based on Fitts' Law
+    duration = _fitts_time(dist, target_width)
+    steps = max(10, int(duration * 80))
+
+    points = []
+    for i in range(steps):
+        t = i / (steps - 1)
+        # Ease-in-out (slow start/end, fast middle) - neuromotor model
+        if t < 0.5:
+            ease = 2 * t * t
+        else:
+            ease = 1 - (-2 * t + 2)**2 / 2
+        x, y = _bezier_point(ease, p0, c1, c2, p3)
+        # Micro-jitter (gaussian, decreases near target)
+        jitter_scale = 0.8 * (1 - t * 0.7)
+        x += _r.gauss(0, jitter_scale)
+        y += _r.gauss(0, jitter_scale)
+        # Delay: variable based on velocity (slow at start/end)
+        base_delay = duration / steps
+        if t < 0.15:
+            delay = base_delay * (2.0 - t * 6)
+        elif t > 0.85:
+            delay = base_delay * (1.0 + (t - 0.85) * 6)
+        else:
+            delay = base_delay * _r.uniform(0.7, 1.1)
+        points.append((x, y, max(0.003, delay + _r.uniform(-0.002, 0.002))))
+
+    return points
+
+
+def _overshoot_point(ex, ey, radius=120.0):
+    """Generate an overshoot destination past the target."""
+    import random as _r, math as _m
+    angle = _r.uniform(0, 2 * _m.pi)
+    dist = _r.uniform(radius * 0.3, radius)
+    return (ex + dist * _m.cos(angle), ey + dist * _m.sin(angle))
+
+
 class _Mouse:
+    OVERSHOOT_THRESHOLD = 500  # px - trigger overshoot above this distance
+    OVERSHOOT_RADIUS = 120     # px - max overshoot distance
+
     def __init__(self, page: RDPPage):
         self._page = page
+        import random as _r
+        self._x: float = _r.uniform(300, 700)
+        self._y: float = _r.uniform(200, 500)
+
+    async def _raw_move(self, x: float, y: float) -> None:
+        if self._page._bridge and self._page._bridge.is_connected and self._page._tab_id is not None:
+            await self._page._bridge.send_command(
+                "moveTo", {"tabId": self._page._tab_id, "x": x, "y": y}
+            )
+
+    async def _follow_path(self, path):
+        for x, y, delay in path:
+            await self._raw_move(x, y)
+            await asyncio.sleep(delay)
+        if path:
+            self._x, self._y = path[-1][0], path[-1][1]
 
     async def click(self, x: float, y: float, button: int = 0) -> None:
         if self._page._bridge and self._page._bridge.is_connected and self._page._tab_id is not None:
@@ -702,10 +1214,34 @@ class _Mouse:
             )
 
     async def move(self, x: float, y: float) -> None:
-        if self._page._bridge and self._page._bridge.is_connected and self._page._tab_id is not None:
-            await self._page._bridge.send_command(
-                "moveTo", {"tabId": self._page._tab_id, "x": x, "y": y}
-            )
+        """Instant move (no animation). Use move_smooth() for human-like."""
+        await self._raw_move(x, y)
+        self._x, self._y = x, y
+
+    async def move_smooth(self, x: float, y: float, target_width: float = 50.0) -> None:
+        """Human-like mouse movement: Bezier curve + Fitts' Law + overshoot."""
+        import math
+        dist = math.sqrt((x - self._x)**2 + (y - self._y)**2)
+
+        if dist > self.OVERSHOOT_THRESHOLD:
+            # Overshoot: move past target, then correct
+            ox, oy = _overshoot_point(x, y, self.OVERSHOOT_RADIUS)
+            path = _generate_path(self._x, self._y, ox, oy, target_width)
+            await self._follow_path(path)
+            # Correction: short, precise movement back to target
+            path = _generate_path(self._x, self._y, x, y, target_width * 2)
+            await self._follow_path(path)
+        else:
+            path = _generate_path(self._x, self._y, x, y, target_width)
+            await self._follow_path(path)
+
+    async def click_smooth(self, x: float, y: float, button: int = 0,
+                           target_width: float = 50.0) -> None:
+        """Human-like: move to target with Bezier, pause, click."""
+        import random as _r
+        await self.move_smooth(x, y, target_width)
+        await asyncio.sleep(_r.uniform(0.04, 0.12))
+        await self.click(self._x, self._y, button)
 
     async def down(self, x: float, y: float, button: int = 0) -> None:
         if self._page._bridge and self._page._bridge.is_connected and self._page._tab_id is not None:
@@ -792,7 +1328,7 @@ class RDPBrowser:
             if not locale:
                 lang = fingerprint.get("locale:language", "en")
                 region = fingerprint.get("locale:region", "US")
-                locale = f"{lang}-{region}"
+                locale = f"{lang}-{region}, {lang}, en-US, en"
 
         self._executable = executable_path or _get_default_binary()
         self._headless = headless
@@ -930,7 +1466,7 @@ class RDPBrowser:
                 prefs["network.proxy.ssl"] = proxy_host
                 prefs["network.proxy.ssl_port"] = proxy_port
                 prefs["network.proxy.no_proxies_on"] = "localhost, 127.0.0.1"
-        if self._locale and not self._fingerprint:
+        if self._locale:
             prefs["intl.accept_languages"] = self._locale
         _write_user_prefs(self._profile_path, prefs)
 
@@ -1100,7 +1636,7 @@ class RDPBrowser:
                         except Exception:
                             pass
 
-                    return RDPPage(
+                    page = RDPPage(
                         client=self._client,
                         tab_actor_id=tab_actor_id,
                         target_actor_id=target.get("actor", ""),
@@ -1109,6 +1645,8 @@ class RDPBrowser:
                         bridge=self._bridge,
                         tab_id=tab_id,
                     )
+                    await asyncio.to_thread(page._start_persistent_watcher)
+                    return page
             await asyncio.sleep(1)
 
         raise RuntimeError("No tabs available after waiting")
