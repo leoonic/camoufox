@@ -341,25 +341,19 @@ class RDPPage:
         return self._url
 
     async def goto(self, url: str, wait_until: str = "load", timeout: int = 30000) -> None:
-        target_event = "dom-complete" if wait_until in ("load", "networkidle") else "dom-interactive"
-        load_done = asyncio.Event()
-
-        def _on_resource(data):
-            for item in data.get("array", data.get("resources", [data])):
-                if isinstance(item, dict) and item.get("resourceType") == "document-event":
-                    name = item.get("name", "")
-                    if name == "dom-complete" or (target_event == "dom-interactive" and name == "dom-interactive"):
-                        load_done.set()
-
-        # Setup watcher for document events
+        # Listen for TARGET_AVAILABLE_FORM to know when cross-process nav completes
+        target_ready = asyncio.Event()
         tab = TabActor(self._client, self._tab_actor_id)
         watcher_ctx = tab.get_watcher()
-        watcher = WatcherActor(self._client, watcher_ctx["actor"])
-        watcher.watch_resources([Resources.DOCUMENT_EVENT])
+        watcher_id = watcher_ctx["actor"]
+
+        def _on_target(data):
+            target = data.get("target", {})
+            if target.get("isTopLevelTarget") and target.get("url", "").startswith("http"):
+                target_ready.set()
+
         self._client.add_event_listener(
-            watcher_ctx["actor"],
-            Events.Watcher.RESOURCES_AVAILABLE_ARRAY,
-            _on_resource,
+            watcher_id, Events.Watcher.TARGET_AVAILABLE_FORM, _on_target
         )
 
         try:
@@ -371,23 +365,30 @@ class RDPPage:
             self._url = url
             self._console_started = False
 
+            # Wait for new target (cross-process nav), max 5s
             try:
-                await asyncio.wait_for(load_done.wait(), timeout=timeout / 1000)
+                await asyncio.wait_for(target_ready.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 pass
+
+            # Refresh to get the new actor IDs
+            await asyncio.to_thread(self._refresh_target)
+
+            # Now poll readyState with the correct actor
+            target_state = "complete" if wait_until in ("load", "networkidle") else "interactive"
+            deadline = time.time() + (timeout / 1000)
+            while time.time() < deadline:
+                try:
+                    state = await self.evaluate("document.readyState")
+                    if state == target_state or state == "complete":
+                        return
+                except Exception:
+                    await asyncio.to_thread(self._refresh_target)
+                await asyncio.sleep(0.3)
         finally:
             self._client.remove_event_listener(
-                watcher_ctx["actor"],
-                Events.Watcher.RESOURCES_AVAILABLE_ARRAY,
-                _on_resource,
+                watcher_id, Events.Watcher.TARGET_AVAILABLE_FORM, _on_target
             )
-            try:
-                watcher.unwatch_resources([Resources.DOCUMENT_EVENT])
-            except Exception:
-                pass
-
-        # Refresh target after navigation (cross-process)
-        await asyncio.to_thread(self._refresh_target)
 
     async def reload(self, timeout: int = 30000) -> None:
         def _reload():
