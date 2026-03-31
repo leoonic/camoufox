@@ -462,14 +462,42 @@ class RDPPage:
             # Snapshot target version before navigating
             ver_before = self._target_ver
 
-            await asyncio.to_thread(
-                lambda: WindowGlobalActor(self._client, self._target_actor_id)
-                .navigate_to(url)
-            )
+            # Navigate via anchor click (sends sec-fetch-user:?1) when on
+            # a real page. Falls back to TabDescriptor for about:blank.
+            escaped = url.replace("\\", "\\\\").replace("'", "\\'")
+            has_body = False
+            try:
+                has_body = await self.evaluate("!!document.body")
+            except Exception:
+                pass
+
+            if has_body and self._bridge and self._bridge.is_connected and self._tab_id is not None:
+                await self.evaluate(
+                    f"(function(){{"
+                    f"var a=document.createElement('a');"
+                    f"a.href='{escaped}';"
+                    f"a.style.cssText='position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;';"
+                    f"document.body.appendChild(a);"
+                    f"}})()"
+                )
+                await asyncio.sleep(0.02)
+                await self._bridge.send_command(
+                    "click", {"tabId": self._tab_id, "x": 0, "y": 0}
+                )
+            else:
+                await asyncio.to_thread(
+                    lambda: self._client.send_receive({
+                        "to": self._tab_actor_id,
+                        "type": "navigateTo",
+                        "url": url,
+                        "waitForLoad": True,
+                    })
+                )
             self._url = url
             self._console_started = False
 
             last_target_ver = ver_before
+            nav_started = False
 
             async with self._with_idle_mouse():
               while time.time() < deadline:
@@ -479,6 +507,7 @@ class RDPPage:
                 # Persistent watcher updated the target (cross-process nav)
                 if self._target_ver > last_target_ver:
                     last_target_ver = self._target_ver
+                    nav_started = True
                     await asyncio.to_thread(
                         lambda: _attach_console_listener(self._console_actor_id)
                     )
@@ -497,7 +526,6 @@ class RDPPage:
                         pass
                     continue
 
-                # Wait for doc event, with readyState fallback every 1s
                 remaining = max(0.1, deadline - time.time())
                 try:
                     await asyncio.wait_for(load_done.wait(), timeout=min(1.0, remaining))
@@ -505,13 +533,19 @@ class RDPPage:
                 except asyncio.TimeoutError:
                     try:
                         state = await self.evaluate("document.readyState")
-                        if state == "complete" or (
-                            goal == "dom-interactive"
-                            and state in ("interactive", "complete")
+                        # Only trust "complete" if we saw nav start first
+                        if state in ("loading", "interactive"):
+                            nav_started = True
+                        if nav_started and (
+                            state == "complete" or (
+                                goal == "dom-interactive"
+                                and state in ("interactive", "complete")
+                            )
                         ):
                             return
                     except Exception:
-                        pass
+                        # evaluate failed = actor stale = nav in progress
+                        nav_started = True
         finally:
             for cid in console_listeners:
                 try:
@@ -1517,7 +1551,8 @@ class RDPBrowser:
         await self._wait_for_bridge()
         await self._apply_overrides()
 
-    async def _connect_rdp(self, max_retries: int = 20) -> None:
+    async def _connect_rdp(self, max_retries: int = 5) -> None:
+        await _wait_for_port("localhost", self._rdp_port, timeout=30.0)
         for i in range(max_retries):
             try:
                 client = RDPClient(timeout_sec=10)
