@@ -465,13 +465,15 @@ class RDPPage:
             # Navigate via anchor click (sends sec-fetch-user:?1) when on
             # a real page. Falls back to TabDescriptor for about:blank.
             escaped = url.replace("\\", "\\\\").replace("'", "\\'")
-            has_body = False
+            can_anchor = False
             try:
-                has_body = await self.evaluate("!!document.body")
+                can_anchor = await self.evaluate(
+                    "!!document.body && window.location.href !== 'about:blank'"
+                )
             except Exception:
                 pass
 
-            if has_body and self._bridge and self._bridge.is_connected and self._tab_id is not None:
+            if can_anchor and self._bridge and self._bridge.is_connected and self._tab_id is not None:
                 await self.evaluate(
                     f"(function(){{"
                     f"var a=document.createElement('a');"
