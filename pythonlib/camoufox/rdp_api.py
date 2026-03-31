@@ -462,37 +462,40 @@ class RDPPage:
             # Snapshot target version before navigating
             ver_before = self._target_ver
 
-            # Navigate via anchor click (sends sec-fetch-user:?1) when on
-            # a real page. Falls back to TabDescriptor for about:blank.
-            escaped = url.replace("\\", "\\\\").replace("'", "\\'")
-            can_anchor = False
-            try:
-                can_anchor = await self.evaluate(
-                    "!!document.body && window.location.href !== 'about:blank'"
-                )
-            except Exception:
-                pass
+            # Navigate via anchor click (sends sec-fetch-user:?1).
+            # Falls back to TabDescriptor for about:blank or no bridge.
+            navigated = False
+            if self._bridge and self._bridge.is_connected and self._tab_id is not None:
+                try:
+                    cur = await self.evaluate("window.location.href")
+                    if cur and cur != "about:blank":
+                        escaped = url.replace("\\", "\\\\").replace("'", "\\'")
+                        await self.evaluate(
+                            f"(function(){{"
+                            f"var o=document.getElementById('__nav');if(o)o.remove();"
+                            f"var a=document.createElement('a');"
+                            f"a.href='{escaped}';"
+                            f"a.id='__nav';"
+                            f"a.style.cssText='position:fixed;top:0;left:0;width:10px;height:10px;"
+                            f"opacity:0;pointer-events:auto;z-index:2147483647;display:block;';"
+                            f"document.body.appendChild(a);"
+                            f"}})()"
+                        )
+                        await asyncio.sleep(0.02)
+                        await self._bridge.send_command(
+                            "click", {"tabId": self._tab_id, "x": 5, "y": 5}
+                        )
+                        navigated = True
+                except Exception:
+                    pass
 
-            if can_anchor and self._bridge and self._bridge.is_connected and self._tab_id is not None:
-                await self.evaluate(
-                    f"(function(){{"
-                    f"var a=document.createElement('a');"
-                    f"a.href='{escaped}';"
-                    f"a.style.cssText='position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;';"
-                    f"document.body.appendChild(a);"
-                    f"}})()"
-                )
-                await asyncio.sleep(0.02)
-                await self._bridge.send_command(
-                    "click", {"tabId": self._tab_id, "x": 0, "y": 0}
-                )
-            else:
+            if not navigated:
                 await asyncio.to_thread(
                     lambda: self._client.send_receive({
                         "to": self._tab_actor_id,
                         "type": "navigateTo",
                         "url": url,
-                        "waitForLoad": True,
+                        "waitForLoad": False,
                     })
                 )
             self._url = url
