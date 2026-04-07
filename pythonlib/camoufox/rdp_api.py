@@ -462,30 +462,16 @@ class RDPPage:
             # Snapshot target version before navigating
             ver_before = self._target_ver
 
-            # Navigate via anchor click (sends sec-fetch-user:?1).
+            # Navigate via BrowsingContext.fixupAndLoadURIString with user activation.
+            # Sends sec-fetch-user:?1 without any DOM manipulation.
             # Falls back to TabDescriptor for about:blank or no bridge.
             navigated = False
             if self._bridge and self._bridge.is_connected and self._tab_id is not None:
                 try:
-                    cur = await self.evaluate("window.location.href")
-                    if cur and cur != "about:blank":
-                        escaped = url.replace("\\", "\\\\").replace("'", "\\'")
-                        await self.evaluate(
-                            f"(function(){{"
-                            f"var o=document.getElementById('__nav');if(o)o.remove();"
-                            f"var a=document.createElement('a');"
-                            f"a.href='{escaped}';"
-                            f"a.id='__nav';"
-                            f"a.style.cssText='position:fixed;top:0;left:0;width:10px;height:10px;"
-                            f"opacity:0;pointer-events:auto;z-index:2147483647;display:block;';"
-                            f"document.body.appendChild(a);"
-                            f"}})()"
-                        )
-                        await asyncio.sleep(0.02)
-                        await self._bridge.send_command(
-                            "click", {"tabId": self._tab_id, "x": 5, "y": 5}
-                        )
-                        navigated = True
+                    await self._bridge.send_command(
+                        "navigate", {"tabId": self._tab_id, "url": url}
+                    )
+                    navigated = True
                 except Exception:
                     pass
 
@@ -674,9 +660,13 @@ class RDPPage:
         # (geckordp returns RDP grips for non-primitives, not actual values)
         if auto_called:
             expr = (
-                f"(function(){{var __r=({expr});"
-                f"return typeof __r==='object'&&__r!==null?JSON.stringify(__r):__r}})()"
+                f"(function(){{var v=({expr});"
+                f"return typeof v==='object'&&v!==null?JSON.stringify(v):v}})()"
             )
+
+        # Mask "debugger eval code" in Error().stack traces
+        if "//# sourceURL=" not in expr:
+            expr += "\n//# sourceURL=resource://gre/modules/AppConstants.sys.mjs"
 
         result = await asyncio.to_thread(self._eval_sync, expr)
 
@@ -710,16 +700,15 @@ class RDPPage:
     async def fill(self, selector: str, text: str) -> None:
         await self.click(selector)
         await asyncio.sleep(0.1)
-
+        # Clear existing value via select-all + delete
         if self._bridge and self._bridge.is_connected and self._tab_id is not None:
+            await self._bridge.send_command("keyPress", {"tabId": self._tab_id, "key": "a", "modifiers": 4})
+            await asyncio.sleep(0.05)
+            await self._bridge.send_command("keyPress", {"tabId": self._tab_id, "key": "Backspace"})
+            await asyncio.sleep(0.05)
             await self._bridge.send_command("type", {"tabId": self._tab_id, "text": text})
         else:
-            await self.evaluate(
-                f"(function(){{ var el = document.querySelector('{selector}');"
-                f"el.value = '{text}';"
-                f"el.dispatchEvent(new Event('input', {{bubbles:true}}));"
-                f"el.dispatchEvent(new Event('change', {{bubbles:true}})); }})()"
-            )
+            raise ConnectionError("Extension bridge not connected, cannot fill with trusted events")
 
     async def screenshot(self, path: Optional[str] = None) -> bytes:
         if self._bridge and self._bridge.is_connected:
@@ -767,6 +756,80 @@ class RDPPage:
                 self._event_listeners[event].remove(callback)
             except ValueError:
                 pass
+
+    # --- Network capture via extension filterResponseData ---
+
+    async def start_capture(self, patterns: list) -> None:
+        """Start capturing HTTP responses whose URL contains any of the patterns.
+        Captured via extension filterResponseData (invisible to page JS)."""
+        if not self._bridge or not self._bridge.is_connected:
+            raise ConnectionError("Extension bridge not connected")
+        await self._bridge.send_command("startCapture", {"patterns": patterns})
+        self._capture_ts = int(time.time() * 1000)
+        logger.info(f"Network capture started for patterns: {patterns}")
+
+    async def stop_capture(self) -> None:
+        """Stop capturing network responses."""
+        if self._bridge and self._bridge.is_connected:
+            await self._bridge.send_command("stopCapture", {})
+
+    async def get_captured_responses(self, clear: bool = True) -> list:
+        """Get captured network responses. Returns list of {url, body, timestamp}."""
+        if not self._bridge or not self._bridge.is_connected:
+            return []
+        since = getattr(self, "_capture_ts", 0)
+        result = await self._bridge.send_command(
+            "getCapturedResponses", {"since": since}
+        )
+        responses = result.get("responses", []) if result else []
+        if clear and responses:
+            await self._bridge.send_command("clearCaptures", {})
+        return responses
+
+    async def wait_for_response(self, url_pattern: str, timeout: float = 30.0) -> Optional[dict]:
+        """Wait until a captured response matching url_pattern appears.
+        Returns the response dict {url, body, timestamp} or None on timeout."""
+        deadline = time.time() + timeout
+        since = getattr(self, "_capture_ts", 0)
+        while time.time() < deadline:
+            if self._bridge and self._bridge.is_connected:
+                result = await self._bridge.send_command(
+                    "getCapturedResponses", {"since": since}
+                )
+                responses = result.get("responses", []) if result else []
+                for r in responses:
+                    if url_pattern in r.get("url", ""):
+                        await self._bridge.send_command("clearCaptures", {})
+                        return r
+            await asyncio.sleep(0.5)
+        return None
+
+    async def start_spy(self, patterns: list) -> None:
+        """Start spying on outgoing requests matching URL patterns.
+        Captures request headers, body, and response body."""
+        if not self._bridge or not self._bridge.is_connected:
+            raise ConnectionError("Extension bridge not connected")
+        await self._bridge.send_command("startSpy", {"patterns": patterns})
+        self._spy_ts = int(time.time() * 1000)
+        logger.info(f"Request spy started for patterns: {patterns}")
+
+    async def stop_spy(self) -> None:
+        """Stop spying on requests."""
+        if self._bridge and self._bridge.is_connected:
+            await self._bridge.send_command("stopSpy", {})
+
+    async def get_spied_requests(self, clear: bool = False) -> list:
+        """Get spied requests. Returns list of {url, method, headers, body, responseBody, timestamp}."""
+        if not self._bridge or not self._bridge.is_connected:
+            return []
+        since = getattr(self, "_spy_ts", 0)
+        result = await self._bridge.send_command(
+            "getSpiedRequests", {"since": since}
+        )
+        requests = result.get("requests", []) if result else []
+        if clear and requests:
+            await self._bridge.send_command("clearSpied", {})
+        return requests
 
     async def wait_for_load_state(self, state: str = "load", timeout: int = 30000) -> None:
         # Quick check: already at target state?
@@ -917,19 +980,20 @@ class RDPPage:
         Returns element rect or None on timeout."""
         sel_escaped = selector.replace("'", "\\'")
 
-        # Generate unique key for this wait
-        wfs_key = f"__wfs_{id(self)}_{int(time.time()*1000) % 100000}"
+        # Use a namespaced store to avoid detectable global variable patterns
+        wfs_key = f"_s{int(time.time()*1000) % 100000}"
 
         if state == "hidden":
             setup_js = (
                 f"(function(){{"
-                f"  if (!document.querySelector('{sel_escaped}')) {{ window['{wfs_key}']='ok'; return '{wfs_key}'; }}"
+                f"  if(!window._ws)window._ws={{}};"
+                f"  if (!document.querySelector('{sel_escaped}')) {{ window._ws['{wfs_key}']='ok'; return '{wfs_key}'; }}"
                 f"  var obs = new MutationObserver(function(){{"
-                f"    if (!document.querySelector('{sel_escaped}')) {{ obs.disconnect(); window['{wfs_key}']='ok'; }}"
+                f"    if (!document.querySelector('{sel_escaped}')) {{ obs.disconnect(); window._ws['{wfs_key}']='ok'; }}"
                 f"  }});"
                 f"  obs.observe(document.body||document.documentElement,"
                 f"    {{childList:true,subtree:true,attributes:true}});"
-                f"  setTimeout(function(){{ obs.disconnect(); if(!window['{wfs_key}']) window['{wfs_key}']='timeout'; }},{timeout});"
+                f"  setTimeout(function(){{ obs.disconnect(); if(!window._ws['{wfs_key}']) window._ws['{wfs_key}']='timeout'; }},{timeout});"
                 f"  return '{wfs_key}';"
                 f"}})()"
             )
@@ -937,19 +1001,20 @@ class RDPPage:
             vis_check = "if(r.width===0&&r.height===0) return null;" if state == "visible" else ""
             setup_js = (
                 f"(function(){{"
+                f"  if(!window._ws)window._ws={{}};"
                 f"  function chk(){{"
                 f"    var el=document.querySelector('{sel_escaped}');"
                 f"    if(!el) return null;"
                 f"    var r=el.getBoundingClientRect(); {vis_check}"
                 f"    return JSON.stringify({{x:r.x,y:r.y,w:r.width,h:r.height}});"
                 f"  }}"
-                f"  var hit=chk(); if(hit){{ window['{wfs_key}']=hit; return '{wfs_key}'; }}"
+                f"  var hit=chk(); if(hit){{ window._ws['{wfs_key}']=hit; return '{wfs_key}'; }}"
                 f"  var obs=new MutationObserver(function(){{"
-                f"    var hit=chk(); if(hit){{ obs.disconnect(); window['{wfs_key}']=hit; }}"
+                f"    var hit=chk(); if(hit){{ obs.disconnect(); window._ws['{wfs_key}']=hit; }}"
                 f"  }});"
                 f"  obs.observe(document.body||document.documentElement,"
                 f"    {{childList:true,subtree:true,attributes:true}});"
-                f"  setTimeout(function(){{ obs.disconnect(); if(!window['{wfs_key}']) window['{wfs_key}']='timeout'; }},{timeout});"
+                f"  setTimeout(function(){{ obs.disconnect(); if(!window._ws['{wfs_key}']) window._ws['{wfs_key}']='timeout'; }},{timeout});"
                 f"  return '{wfs_key}';"
                 f"}})()"
             )
@@ -959,14 +1024,12 @@ class RDPPage:
         except Exception:
             return None
 
-        # Poll the global variable (very cheap: single variable read)
         deadline = time.time() + (timeout / 1000)
         while time.time() < deadline:
             try:
-                val = await self.evaluate(f"window['{wfs_key}']")
+                val = await self.evaluate(f"(window._ws||{{}})['{wfs_key}']")
                 if val and val != "null":
-                    # Cleanup
-                    await self.evaluate(f"delete window['{wfs_key}']")
+                    await self.evaluate(f"try{{delete window._ws['{wfs_key}']}}catch(e){{}}")
                     if val == "timeout":
                         return None
                     if val == "ok":
@@ -977,6 +1040,11 @@ class RDPPage:
             except Exception:
                 pass
             await asyncio.sleep(0.1)
+        # Cleanup on timeout
+        try:
+            await self.evaluate(f"try{{delete window._ws['{wfs_key}']}}catch(e){{}}")
+        except Exception:
+            pass
         return None
 
     def locator(self, selector: str) -> "_Locator":
@@ -1035,36 +1103,38 @@ class _Locator:
 
     async def wait_for(self, state: str = "visible", timeout: int = 5000) -> None:
         find_js = self._to_css_and_js()
-        wfs_key = f"__wfl_{id(self)}_{int(time.time()*1000) % 100000}"
+        wfs_key = f"_l{int(time.time()*1000) % 100000}"
 
         if state == "hidden":
             setup_js = (
                 f"(function(){{"
-                f"  if (({find_js}) === null) {{ window['{wfs_key}']='ok'; return; }}"
+                f"  if(!window._ws)window._ws={{}};"
+                f"  if (({find_js}) === null) {{ window._ws['{wfs_key}']='ok'; return; }}"
                 f"  var obs = new MutationObserver(function(){{"
-                f"    if (({find_js}) === null) {{ obs.disconnect(); window['{wfs_key}']='ok'; }}"
+                f"    if (({find_js}) === null) {{ obs.disconnect(); window._ws['{wfs_key}']='ok'; }}"
                 f"  }});"
                 f"  obs.observe(document.body||document.documentElement,"
                 f"    {{childList:true,subtree:true,attributes:true}});"
-                f"  setTimeout(function(){{ obs.disconnect(); if(!window['{wfs_key}']) window['{wfs_key}']='timeout'; }},{timeout});"
+                f"  setTimeout(function(){{ obs.disconnect(); if(!window._ws['{wfs_key}']) window._ws['{wfs_key}']='timeout'; }},{timeout});"
                 f"}})()"
             )
         else:
             vis = "if(r.width===0&&r.height===0) return null; " if state == "visible" else ""
             setup_js = (
                 f"(function(){{"
+                f"  if(!window._ws)window._ws={{}};"
                 f"  function chk(){{"
                 f"    var el={find_js}; if(!el) return null;"
                 f"    var r=el.getBoundingClientRect(); {vis}"
                 f"    return JSON.stringify({{x:r.x,y:r.y,w:r.width,h:r.height}});"
                 f"  }}"
-                f"  var hit=chk(); if(hit){{ window['{wfs_key}']=hit; return; }}"
+                f"  var hit=chk(); if(hit){{ window._ws['{wfs_key}']=hit; return; }}"
                 f"  var obs=new MutationObserver(function(){{"
-                f"    var hit=chk(); if(hit){{ obs.disconnect(); window['{wfs_key}']=hit; }}"
+                f"    var hit=chk(); if(hit){{ obs.disconnect(); window._ws['{wfs_key}']=hit; }}"
                 f"  }});"
                 f"  obs.observe(document.body||document.documentElement,"
                 f"    {{childList:true,subtree:true,attributes:true}});"
-                f"  setTimeout(function(){{ obs.disconnect(); if(!window['{wfs_key}']) window['{wfs_key}']='timeout'; }},{timeout});"
+                f"  setTimeout(function(){{ obs.disconnect(); if(!window._ws['{wfs_key}']) window._ws['{wfs_key}']='timeout'; }},{timeout});"
                 f"}})()"
             )
 
@@ -1072,13 +1142,17 @@ class _Locator:
 
         deadline = time.time() + (timeout / 1000)
         while time.time() < deadline:
-            val = await self._page.evaluate(f"window['{wfs_key}']")
+            val = await self._page.evaluate(f"(window._ws||{{}})['{wfs_key}']")
             if val and val != "null":
-                await self._page.evaluate(f"delete window['{wfs_key}']")
+                await self._page.evaluate(f"try{{delete window._ws['{wfs_key}']}}catch(e){{}}")
                 if val == "timeout":
                     raise TimeoutError(f"Locator '{self._selector}' not {state} within {timeout}ms")
                 return
             await asyncio.sleep(0.1)
+        try:
+            await self._page.evaluate(f"try{{delete window._ws['{wfs_key}']}}catch(e){{}}")
+        except Exception:
+            pass
         raise TimeoutError(f"Locator '{self._selector}' not {state} within {timeout}ms")
 
     async def click(self, timeout: int = 5000) -> None:
@@ -1135,94 +1209,10 @@ class _Locator:
         return result or 0
 
 
-def _bezier_point(t: float, p0, p1, p2, p3):
-    u = 1 - t
-    return (
-        u*u*u * p0[0] + 3*u*u*t * p1[0] + 3*u*t*t * p2[0] + t*t*t * p3[0],
-        u*u*u * p0[1] + 3*u*u*t * p1[1] + 3*u*t*t * p2[1] + t*t*t * p3[1],
-    )
-
-
-def _generate_control_points(sx, sy, ex, ey):
-    """Generate 2 control points perpendicular to the path (ghost-cursor style)."""
-    import random as _r, math as _m
-    dx, dy = ex - sx, ey - sy
-    dist = _m.sqrt(dx*dx + dy*dy) or 1.0
-    spread = max(2.0, min(200.0, dist * 0.5))
-    # Perpendicular unit vector
-    px, py = -dy / dist, dx / dist
-    # Both control points deviate to the same side (more natural)
-    side = _r.choice([-1, 1])
-    # Control point at ~25% of path
-    off1 = side * _r.uniform(spread * 0.05, spread * 0.1)
-    c1 = (sx + dx * 0.25 + px * off1, sy + dy * 0.25 + py * off1)
-    # Control point at ~75% of path
-    off2 = side * _r.uniform(spread * 0.05, spread * 0.1)
-    c2 = (sx + dx * 0.75 + px * off2, sy + dy * 0.75 + py * off2)
-    return c1, c2
-
-
-def _fitts_time(distance: float, width: float = 50.0) -> float:
-    """Fitts' Law: movement time based on distance and target width."""
-    import math as _m
-    if distance < 1:
-        return 0.05
-    idx = _m.log2(distance / width + 1)
-    return 0.1 + idx * 0.08
-
-
-def _generate_path(sx, sy, ex, ey, target_width=50.0):
-    """Generate a human-like Bezier path with Fitts' Law timing."""
-    import math as _m, random as _r
-    dist = _m.sqrt((ex - sx)**2 + (ey - sy)**2)
-    if dist < 1:
-        return [(ex, ey, 0.01)]
-
-    c1, c2 = _generate_control_points(sx, sy, ex, ey)
-    p0, p3 = (sx, sy), (ex, ey)
-
-    # Step count based on Fitts' Law
-    duration = _fitts_time(dist, target_width)
-    steps = max(10, int(duration * 80))
-
-    points = []
-    for i in range(steps):
-        t = i / (steps - 1)
-        # Ease-in-out (slow start/end, fast middle) - neuromotor model
-        if t < 0.5:
-            ease = 2 * t * t
-        else:
-            ease = 1 - (-2 * t + 2)**2 / 2
-        x, y = _bezier_point(ease, p0, c1, c2, p3)
-        # Micro-jitter (gaussian, decreases near target)
-        jitter_scale = 0.8 * (1 - t * 0.7)
-        x += _r.gauss(0, jitter_scale)
-        y += _r.gauss(0, jitter_scale)
-        # Delay: variable based on velocity (slow at start/end)
-        base_delay = duration / steps
-        if t < 0.15:
-            delay = base_delay * (2.0 - t * 6)
-        elif t > 0.85:
-            delay = base_delay * (1.0 + (t - 0.85) * 6)
-        else:
-            delay = base_delay * _r.uniform(0.7, 1.1)
-        points.append((x, y, max(0.003, delay + _r.uniform(-0.002, 0.002))))
-
-    return points
-
-
-def _overshoot_point(ex, ey, radius=120.0):
-    """Generate an overshoot destination past the target."""
-    import random as _r, math as _m
-    angle = _r.uniform(0, 2 * _m.pi)
-    dist = _r.uniform(radius * 0.3, radius)
-    return (ex + dist * _m.cos(angle), ey + dist * _m.sin(angle))
+from camoufox.humanize import generate_path as _generate_path, hover_delay as _hover_delay
 
 
 class _Mouse:
-    OVERSHOOT_THRESHOLD = 500  # px - trigger overshoot above this distance
-    OVERSHOOT_RADIUS = 120     # px - max overshoot distance
-
     def __init__(self, page: RDPPage):
         self._page = page
         import random as _r
@@ -1258,28 +1248,15 @@ class _Mouse:
         self._x, self._y = x, y
 
     async def move_smooth(self, x: float, y: float, target_width: float = 50.0) -> None:
-        """Human-like mouse movement: Bezier curve + Fitts' Law + overshoot."""
-        import math
-        dist = math.sqrt((x - self._x)**2 + (y - self._y)**2)
-
-        if dist > self.OVERSHOOT_THRESHOLD:
-            # Overshoot: move past target, then correct
-            ox, oy = _overshoot_point(x, y, self.OVERSHOOT_RADIUS)
-            path = _generate_path(self._x, self._y, ox, oy, target_width)
-            await self._follow_path(path)
-            # Correction: short, precise movement back to target
-            path = _generate_path(self._x, self._y, x, y, target_width * 2)
-            await self._follow_path(path)
-        else:
-            path = _generate_path(self._x, self._y, x, y, target_width)
-            await self._follow_path(path)
+        """Human-like mouse movement with sub-movements, overshoot, tremor."""
+        path = _generate_path(self._x, self._y, x, y, target_width)
+        await self._follow_path(path)
 
     async def click_smooth(self, x: float, y: float, button: int = 0,
                            target_width: float = 50.0) -> None:
-        """Human-like: move to target with Bezier, pause, click."""
-        import random as _r
+        """Human-like: move to target, hover delay, click."""
         await self.move_smooth(x, y, target_width)
-        await asyncio.sleep(_r.uniform(0.04, 0.12))
+        await asyncio.sleep(_hover_delay())
         await self.click(self._x, self._y, button)
 
     async def down(self, x: float, y: float, button: int = 0) -> None:
@@ -1295,14 +1272,22 @@ class _Mouse:
             )
 
     async def wheel(self, delta_x: float, delta_y: float) -> None:
+        """Single wheel event. Use wheel_smooth() for human-like scrolling."""
         if self._page._bridge and self._page._bridge.is_connected and self._page._tab_id is not None:
             await self._page._bridge.send_command(
-                "scroll", {"tabId": self._page._tab_id, "x": 400, "y": 300, "deltaX": delta_x, "deltaY": delta_y}
+                "scroll", {"tabId": self._page._tab_id,
+                           "x": self._x, "y": self._y,
+                           "deltaX": delta_x, "deltaY": delta_y}
             )
-        else:
-            await self._page.evaluate(
-                f"window.scrollBy({{left:{delta_x},top:{delta_y},behavior:'smooth'}})"
-            )
+
+    async def wheel_smooth(self, delta_y: float) -> None:
+        """Human-like scroll: bursts with momentum decay and reading pauses."""
+        from camoufox.humanize import scroll_sequence
+        events = scroll_sequence(delta_y)
+        for dy, delay in events:
+            if abs(dy) > 0.5:
+                await self.wheel(0, dy)
+            await asyncio.sleep(delay)
 
 
 class _Keyboard:
@@ -1398,6 +1383,8 @@ class RDPBrowser:
                                       username: str, password: str) -> str:
         """Copy extension to temp dir and inject proxy routing + auth."""
         ext_copy = os.path.join(self._profile_path, "_ext_with_proxy")
+        if os.path.exists(ext_copy):
+            shutil.rmtree(ext_copy)
         shutil.copytree(EXTENSION_DIR, ext_copy)
         bg_path = os.path.join(ext_copy, "background.js")
         with open(bg_path, "r", encoding="utf-8") as f:
@@ -1483,7 +1470,7 @@ class RDPBrowser:
             "test.events.async.enabled": True,
             # Tell the extension exactly which WS port to connect to
             # (avoids scanning 8775-8790 which causes multi-instance conflicts).
-            "extensions.camoufox.ws_port": self._ws_port,
+            "extensions.input.ws_port": self._ws_port,
         }
         if self._proxy:
             parsed = urlparse(
@@ -1704,20 +1691,26 @@ class RDPBrowser:
             self._client = None
 
         if self._proc:
-            # Kill all processes in the Job Object (browser + all children)
-            if self._job and _kernel32:
-                _kernel32.TerminateJobObject(self._job, 1)
-                _kernel32.CloseHandle(self._job)
-                self._job = None
-            else:
-                self._proc.terminate()
+            # Graceful shutdown: terminate first to let Firefox flush cookies/state
+            self._proc.terminate()
             try:
                 self._proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
+                # Force kill if graceful shutdown failed
+                if self._job and _kernel32:
+                    _kernel32.TerminateJobObject(self._job, 1)
+                else:
+                    try:
+                        self._proc.kill()
+                    except Exception:
+                        pass
                 try:
-                    self._proc.kill()
+                    self._proc.wait(timeout=3)
                 except Exception:
                     pass
+            if self._job and _kernel32:
+                _kernel32.CloseHandle(self._job)
+                self._job = None
             self._proc = None
             await asyncio.sleep(0.5)
 

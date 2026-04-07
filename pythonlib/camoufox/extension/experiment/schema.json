@@ -81,6 +81,15 @@
           {"name": "tabId", "type": "integer"},
           {"name": "key", "type": "string"}
         ]
+      },
+      {
+        "name": "navigateTo",
+        "type": "function",
+        "async": true,
+        "parameters": [
+          {"name": "tabId", "type": "integer"},
+          {"name": "url", "type": "string"}
+        ]
       }
     ]
   }

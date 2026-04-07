@@ -1,19 +1,22 @@
 (function() {
-  if (window.__camoufoxCursor) return;
-  window.__camoufoxCursor = true;
+  if (window.__cvis_init) return;
+  window.__cvis_init = true;
+
+  var host = document.createElement("div");
+  host.style.cssText = "position:fixed;top:0;left:0;width:0;height:0;z-index:2147483647;pointer-events:none;";
+  var shadow = host.attachShadow({ mode: "closed" });
 
   var dot = document.createElement("div");
   dot.style.cssText =
     "position:fixed;width:10px;height:10px;" +
-    "background:rgba(255,105,105,0.8);border-radius:50%;" +
-    "pointer-events:none;z-index:2147483647;" +
+    "background:rgba(255,140,0,0.8);border-radius:50%;" +
+    "pointer-events:none;" +
     "transform:translate(-50%,-50%);" +
-    "box-shadow:0 0 0 5px rgba(255,105,105,0.5)," +
-    "0 0 0 10px rgba(255,105,105,0.3)," +
-    "0 0 0 15px rgba(255,105,105,0.1);" +
-    "display:none;transition:left 0.05s linear,top 0.05s linear;";
+    "display:none;transition:left 0.04s linear,top 0.04s linear;" +
+    "box-shadow:0 0 4px rgba(255,140,0,0.4);";
 
-  (document.documentElement || document.body).appendChild(dot);
+  shadow.appendChild(dot);
+  (document.documentElement || document.body).appendChild(host);
 
   window.addEventListener("mousemove", function(e) {
     dot.style.left = e.clientX + "px";

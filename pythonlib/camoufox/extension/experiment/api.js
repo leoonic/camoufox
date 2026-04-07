@@ -33,7 +33,7 @@ this.nativeInput = class extends ExtensionAPI {
             buttons: opts.buttons || 0,
             clickCount: opts.clickCount || 0,
             modifiers: 0,
-            pressure: 0.0,
+            pressure: (type === "mousedown" || type === "mouseup") ? 0.5 : 0.0,
             inputSource: 1,
           },
           {
@@ -106,7 +106,7 @@ this.nativeInput = class extends ExtensionAPI {
 
         async getPort() {
           const { Services } = globalThis;
-          return Services.prefs.getIntPref("extensions.camoufox.ws_port", 8775);
+          return Services.prefs.getIntPref("extensions.input.ws_port", 8775);
         },
 
         async keyPress(tabId, key) {
@@ -119,6 +119,15 @@ this.nativeInput = class extends ExtensionAPI {
           const keyEvent = new win.KeyboardEvent("keydown", { key: key });
           tip.keydown(keyEvent);
           tip.keyup(keyEvent);
+        },
+
+        async navigateTo(tabId, url) {
+          const browser = getBrowserForTab(tabId);
+          browser.browsingContext.fixupAndLoadURIString(url, {
+            triggeringPrincipal:
+              Services.scriptSecurityManager.getSystemPrincipal(),
+            hasValidUserGestureActivation: true,
+          });
         },
       },
     };

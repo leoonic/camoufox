@@ -11,6 +11,172 @@ let reconnectTimer = null;
 let proxyConfig = null;
 let proxyCredentials = null;
 
+// --- Network response capture ---
+let capturePatterns = [];   // URL substrings to match
+let capturedResponses = []; // {url, status, body, timestamp}
+const MAX_CAPTURES = 50;
+
+// --- Request spy: captures outgoing request headers + body + response for URL patterns ---
+let spyPatterns = [];
+let spyPending = new Map();   // requestId -> partial entry
+let spyResults = [];          // completed {url, method, headers, body, responseBody, timestamp}
+const MAX_SPY = 100;
+
+function setupCaptureListener() {
+  // Remove existing listener if any
+  if (browser.webRequest.onBeforeRequest.hasListener(onBeforeRequestCapture)) {
+    browser.webRequest.onBeforeRequest.removeListener(onBeforeRequestCapture);
+  }
+  if (capturePatterns.length === 0) return;
+
+  browser.webRequest.onBeforeRequest.addListener(
+    onBeforeRequestCapture,
+    { urls: ["<all_urls>"] },
+    ["blocking"]
+  );
+}
+
+function onBeforeRequestCapture(details) {
+  const url = details.url;
+  const matched = capturePatterns.some(p => url.includes(p));
+  if (!matched) return {};
+
+  const filter = browser.webRequest.filterResponseData(details.requestId);
+  const chunks = [];
+
+  filter.ondata = (event) => {
+    chunks.push(new Uint8Array(event.data));
+    filter.write(event.data); // pass through to browser
+  };
+
+  filter.onstop = () => {
+    filter.close();
+    // Decode the full response
+    try {
+      const totalLen = chunks.reduce((s, c) => s + c.byteLength, 0);
+      const merged = new Uint8Array(totalLen);
+      let offset = 0;
+      for (const chunk of chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      const body = new TextDecoder("utf-8").decode(merged);
+      capturedResponses.push({
+        url: url,
+        status: null,
+        body: body,
+        timestamp: Date.now(),
+      });
+      // Trim old entries
+      if (capturedResponses.length > MAX_CAPTURES) {
+        capturedResponses = capturedResponses.slice(-MAX_CAPTURES);
+      }
+    } catch (e) {
+      console.error("[cap] decode error:", e);
+    }
+  };
+
+  filter.onerror = () => {
+    try { filter.close(); } catch (_) {}
+  };
+
+  return {};
+}
+
+// --- Spy listeners ---
+
+function setupSpyListeners() {
+  if (browser.webRequest.onBeforeRequest.hasListener(onSpyRequest)) {
+    browser.webRequest.onBeforeRequest.removeListener(onSpyRequest);
+  }
+  if (browser.webRequest.onSendHeaders.hasListener(onSpyHeaders)) {
+    browser.webRequest.onSendHeaders.removeListener(onSpyHeaders);
+  }
+  if (spyPatterns.length === 0) return;
+
+  browser.webRequest.onBeforeRequest.addListener(
+    onSpyRequest,
+    { urls: ["<all_urls>"] },
+    ["blocking", "requestBody"]
+  );
+  browser.webRequest.onSendHeaders.addListener(
+    onSpyHeaders,
+    { urls: ["<all_urls>"] },
+    ["requestHeaders"]
+  );
+}
+
+function onSpyRequest(details) {
+  if (!spyPatterns.some(p => details.url.includes(p))) return {};
+
+  let bodyText = null;
+  if (details.requestBody && details.requestBody.raw) {
+    try {
+      const parts = details.requestBody.raw.map(p => new Uint8Array(p.bytes));
+      const total = parts.reduce((s, p) => s + p.byteLength, 0);
+      const merged = new Uint8Array(total);
+      let off = 0;
+      for (const p of parts) { merged.set(p, off); off += p.byteLength; }
+      bodyText = new TextDecoder("utf-8").decode(merged);
+    } catch (_) { bodyText = "[decode error]"; }
+  } else if (details.requestBody && details.requestBody.formData) {
+    bodyText = JSON.stringify(details.requestBody.formData);
+  }
+
+  const entry = {
+    url: details.url,
+    method: details.method,
+    body: bodyText,
+    headers: null,
+    responseBody: null,
+    timestamp: Date.now(),
+  };
+  spyPending.set(details.requestId, entry);
+
+  // Also capture response body via filterResponseData
+  try {
+    const filter = browser.webRequest.filterResponseData(details.requestId);
+    const chunks = [];
+    filter.ondata = (event) => {
+      chunks.push(new Uint8Array(event.data));
+      filter.write(event.data);
+    };
+    filter.onstop = () => {
+      filter.close();
+      try {
+        const totalLen = chunks.reduce((s, c) => s + c.byteLength, 0);
+        const merged = new Uint8Array(totalLen);
+        let off = 0;
+        for (const c of chunks) { merged.set(c, off); off += c.byteLength; }
+        entry.responseBody = new TextDecoder("utf-8").decode(merged);
+      } catch (_) {}
+      spyResults.push(entry);
+      spyPending.delete(details.requestId);
+      if (spyResults.length > MAX_SPY) spyResults = spyResults.slice(-MAX_SPY);
+    };
+    filter.onerror = () => {
+      try { filter.close(); } catch (_) {}
+      spyResults.push(entry);
+      spyPending.delete(details.requestId);
+    };
+  } catch (_) {
+    // filterResponseData not available, save without response
+    spyResults.push(entry);
+    spyPending.delete(details.requestId);
+  }
+
+  return {};
+}
+
+function onSpyHeaders(details) {
+  const entry = spyPending.get(details.requestId);
+  if (!entry) return;
+  entry.headers = {};
+  for (const h of details.requestHeaders) {
+    entry.headers[h.name] = h.value;
+  }
+}
+
 async function initPort() {
   // Read port from Firefox pref (set by RDPBrowser per-instance)
   try {
@@ -48,8 +214,8 @@ function connect() {
   }
 
   ws.addEventListener("open", () => {
-    console.log(`[CamoufoxInput] Connected on port ${wsPort}`);
-    ws.send(JSON.stringify({ type: "hello", extensionId: "camoufox-rdp-input@local" }));
+    console.log(`[ext] Connected on port ${wsPort}`);
+    ws.send(JSON.stringify({ type: "hello", extensionId: "{d4a1e2b3-8f7c-4e5d-9a6b-3c2d1e0f4a5b}" }));
   });
 
   ws.addEventListener("message", async (event) => {
@@ -131,6 +297,75 @@ function connect() {
           result = { ok: true };
           break;
 
+        case "startCapture":
+          capturePatterns = params.patterns || [];
+          capturedResponses = [];
+          setupCaptureListener();
+          result = { ok: true, patterns: capturePatterns };
+          break;
+
+        case "stopCapture":
+          capturePatterns = [];
+          setupCaptureListener();
+          result = { ok: true };
+          break;
+
+        case "getCapturedResponses": {
+          const minTs = params.since || 0;
+          const filtered = capturedResponses.filter(r => r.timestamp > minTs);
+          result = { responses: filtered };
+          break;
+        }
+
+        case "clearCaptures":
+          capturedResponses = [];
+          result = { ok: true };
+          break;
+
+        case "navigate":
+          await browser.nativeInput.navigateTo(params.tabId, params.url);
+          result = { ok: true };
+          break;
+
+        case "startSpy":
+          spyPatterns = params.patterns || [];
+          spyPending = new Map();
+          spyResults = [];
+          setupSpyListeners();
+          result = { ok: true, patterns: spyPatterns };
+          break;
+
+        case "stopSpy":
+          spyPatterns = [];
+          setupSpyListeners();
+          result = { ok: true };
+          break;
+
+        case "getSpiedRequests": {
+          const spySince = params.since || 0;
+          const spyFiltered = spyResults.filter(r => r.timestamp > spySince);
+          result = { requests: spyFiltered };
+          break;
+        }
+
+        case "clearSpied":
+          spyResults = [];
+          spyPending = new Map();
+          result = { ok: true };
+          break;
+
+        case "bgFetch": {
+          // Fetch from extension background (bypasses page JS monkey-patches)
+          const resp = await fetch(params.url, {
+            method: params.method || "GET",
+            headers: params.headers || {},
+            credentials: "include"  // send cookies
+          });
+          const text = await resp.text();
+          result = { status: resp.status, body: text.substring(0, params.maxBody || 100000) };
+          break;
+        }
+
         case "ping":
           result = { pong: true };
           break;
@@ -156,6 +391,21 @@ function connect() {
     ws = null;
   });
 }
+
+// Cursor indicator: inject into every page via closed Shadow DOM
+function injectCursor(tabId) {
+  browser.tabs.executeScript(tabId, {
+    file: "cursor.js",
+    runAt: "document_idle",
+    allFrames: false
+  }).catch(() => {});
+}
+
+browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status === "complete") {
+    injectCursor(tabId);
+  }
+});
 
 // Init: find port then connect
 initPort().then(() => {

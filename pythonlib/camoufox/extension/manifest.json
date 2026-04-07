@@ -1,11 +1,11 @@
 {
   "manifest_version": 2,
-  "name": "Camoufox RDP Input",
+  "name": "Browser Input",
   "version": "1.0",
-  "description": "Trusted input dispatch via nsIDOMWindowUtils",
+  "description": "Input dispatch helper",
   "browser_specific_settings": {
     "gecko": {
-      "id": "camoufox-rdp-input@local",
+      "id": "{d4a1e2b3-8f7c-4e5d-9a6b-3c2d1e0f4a5b}",
       "strict_min_version": "120.0"
     }
   },
@@ -31,12 +31,5 @@
     "scripts": ["background.js"],
     "persistent": true
   },
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["cursor.js"],
-      "run_at": "document_idle",
-      "all_frames": false
-    }
-  ]
+  "content_scripts": []
 }
