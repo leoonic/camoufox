@@ -14,6 +14,7 @@ Usage:
         await page.mouse.wheel(0, 500)
         await page.screenshot("shot.png")
 """
+
 import asyncio
 import base64
 import ctypes
@@ -86,6 +87,7 @@ def _create_job_object():
         return None
     return job
 
+
 from geckordp.actors.addon.addons import AddonsActor
 from geckordp.actors.descriptors.tab import TabActor
 from geckordp.actors.events import Events
@@ -110,6 +112,7 @@ DEFAULT_WS_PORT = 8775
 def _get_default_binary() -> str:
     try:
         from .pkgman import launch_path
+
         return str(launch_path())
     except Exception:
         return ""
@@ -131,6 +134,7 @@ def _write_user_prefs(profile_dir: str, prefs: Dict[str, Any]) -> None:
 def _check_port(host: str, port: int) -> bool:
     """Synchronous TCP port check (Windows-compatible)."""
     import socket
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(1.0)
     try:
@@ -165,6 +169,7 @@ class _ExtensionBridge:
     async def start(self):
         try:
             import websockets
+
             self._server = await websockets.serve(
                 self._handler, "127.0.0.1", self._port
             )
@@ -254,6 +259,7 @@ class RDPPage:
     async def _idle_mouse_loop(self):
         """Subtle micro-movements while waiting, mimicking human idle behavior."""
         import random as _r
+
         try:
             while True:
                 await asyncio.sleep(_r.uniform(0.4, 1.5))
@@ -311,7 +317,9 @@ class RDPPage:
                 if new_url and new_url.startswith("http"):
                     self._url = new_url
                 self._target_ver += 1
-                logger.debug(f"Persistent watcher: target updated v{self._target_ver} -> {new_console}")
+                logger.debug(
+                    f"Persistent watcher: target updated v{self._target_ver} -> {new_console}"
+                )
 
         self._client.add_event_listener(
             self._watcher_id, Events.Watcher.TARGET_AVAILABLE_FORM, _on_target
@@ -327,7 +335,9 @@ class RDPPage:
                 self._console_actor_id = new_console
                 self._console_started = False
             self._target_actor_id = target.get("actor", self._target_actor_id)
-            self._browsing_context_id = target.get("browsingContextID", self._browsing_context_id)
+            self._browsing_context_id = target.get(
+                "browsingContextID", self._browsing_context_id
+            )
 
     def _ensure_console(self):
         if not self._console_started:
@@ -428,13 +438,19 @@ class RDPPage:
             pass
         return self._url
 
-    async def goto(self, url: str, wait_until: str = "load", timeout: int = 30000) -> None:
+    async def goto(
+        self, url: str, wait_until: str = "load", timeout: int = 30000
+    ) -> None:
         loop = asyncio.get_running_loop()
         load_done = asyncio.Event()
         deadline = time.time() + (timeout / 1000)
         console_listeners: list = []
 
-        goal = "dom-complete" if wait_until in ("load", "networkidle") else "dom-interactive"
+        goal = (
+            "dom-complete"
+            if wait_until in ("load", "networkidle")
+            else "dom-interactive"
+        )
 
         def _on_doc_event(data):
             logger.debug(f"goto DOCUMENT_EVENT: {data}")
@@ -455,7 +471,9 @@ class RDPPage:
             console_listeners.append(console_id)
 
         # Listen on current console for same-origin nav events
-        await asyncio.to_thread(lambda: _attach_console_listener(self._console_actor_id))
+        await asyncio.to_thread(
+            lambda: _attach_console_listener(self._console_actor_id)
+        )
         self._console_started = True
 
         try:
@@ -477,12 +495,14 @@ class RDPPage:
 
             if not navigated:
                 await asyncio.to_thread(
-                    lambda: self._client.send_receive({
-                        "to": self._tab_actor_id,
-                        "type": "navigateTo",
-                        "url": url,
-                        "waitForLoad": False,
-                    })
+                    lambda: self._client.send_receive(
+                        {
+                            "to": self._tab_actor_id,
+                            "type": "navigateTo",
+                            "url": url,
+                            "waitForLoad": False,
+                        }
+                    )
                 )
             self._url = url
             self._console_started = False
@@ -491,52 +511,55 @@ class RDPPage:
             nav_started = False
 
             async with self._with_idle_mouse():
-              while time.time() < deadline:
-                if load_done.is_set():
-                    return
-
-                # Persistent watcher updated the target (cross-process nav)
-                if self._target_ver > last_target_ver:
-                    last_target_ver = self._target_ver
-                    nav_started = True
-                    await asyncio.to_thread(
-                        lambda: _attach_console_listener(self._console_actor_id)
-                    )
-                    self._console_started = True
-
+                while time.time() < deadline:
                     if load_done.is_set():
                         return
-                    try:
-                        state = await self.evaluate("document.readyState")
-                        if state == "complete" or (
-                            goal == "dom-interactive"
-                            and state in ("interactive", "complete")
-                        ):
-                            return
-                    except Exception:
-                        pass
-                    continue
 
-                remaining = max(0.1, deadline - time.time())
-                try:
-                    await asyncio.wait_for(load_done.wait(), timeout=min(1.0, remaining))
-                    return
-                except asyncio.TimeoutError:
-                    try:
-                        state = await self.evaluate("document.readyState")
-                        # Only trust "complete" if we saw nav start first
-                        if state in ("loading", "interactive"):
-                            nav_started = True
-                        if nav_started and (
-                            state == "complete" or (
+                    # Persistent watcher updated the target (cross-process nav)
+                    if self._target_ver > last_target_ver:
+                        last_target_ver = self._target_ver
+                        nav_started = True
+                        await asyncio.to_thread(
+                            lambda: _attach_console_listener(self._console_actor_id)
+                        )
+                        self._console_started = True
+
+                        if load_done.is_set():
+                            return
+                        try:
+                            state = await self.evaluate("document.readyState")
+                            if state == "complete" or (
                                 goal == "dom-interactive"
                                 and state in ("interactive", "complete")
-                            )
-                        ):
-                            return
-                    except Exception:
-                        # evaluate failed = actor stale = nav in progress
-                        nav_started = True
+                            ):
+                                return
+                        except Exception:
+                            pass
+                        continue
+
+                    remaining = max(0.1, deadline - time.time())
+                    try:
+                        await asyncio.wait_for(
+                            load_done.wait(), timeout=min(1.0, remaining)
+                        )
+                        return
+                    except asyncio.TimeoutError:
+                        try:
+                            state = await self.evaluate("document.readyState")
+                            # Only trust "complete" if we saw nav start first
+                            if state in ("loading", "interactive"):
+                                nav_started = True
+                            if nav_started and (
+                                state == "complete"
+                                or (
+                                    goal == "dom-interactive"
+                                    and state in ("interactive", "complete")
+                                )
+                            ):
+                                return
+                        except Exception:
+                            # evaluate failed = actor stale = nav in progress
+                            nav_started = True
         finally:
             for cid in console_listeners:
                 try:
@@ -549,6 +572,7 @@ class RDPPage:
         # Post-navigation: reposition cursor and drift naturally
         try:
             import random as _r
+
             await self.mouse._raw_move(self.mouse._x, self.mouse._y)
             drift_x = self.mouse._x + _r.uniform(-80, 80)
             drift_y = self.mouse._y + _r.uniform(-60, 60)
@@ -577,8 +601,9 @@ class RDPPage:
                 loop.call_soon_threadsafe(done.set)
 
         await asyncio.to_thread(
-            lambda: WebConsoleActor(self._client, console_id)
-            .start_listeners([WebConsoleActor.Listeners.DOCUMENT_EVENTS])
+            lambda: WebConsoleActor(self._client, console_id).start_listeners(
+                [WebConsoleActor.Listeners.DOCUMENT_EVENTS]
+            )
         )
         self._console_started = True
         self._client.add_event_listener(
@@ -615,8 +640,9 @@ class RDPPage:
                 loop.call_soon_threadsafe(done.set)
 
         await asyncio.to_thread(
-            lambda: WebConsoleActor(self._client, console_id)
-            .start_listeners([WebConsoleActor.Listeners.DOCUMENT_EVENTS])
+            lambda: WebConsoleActor(self._client, console_id).start_listeners(
+                [WebConsoleActor.Listeners.DOCUMENT_EVENTS]
+            )
         )
         self._console_started = True
         self._client.add_event_listener(
@@ -702,19 +728,31 @@ class RDPPage:
         await asyncio.sleep(0.1)
         # Clear existing value via select-all + delete
         if self._bridge and self._bridge.is_connected and self._tab_id is not None:
-            await self._bridge.send_command("keyPress", {"tabId": self._tab_id, "key": "a", "modifiers": 4})
+            await self._bridge.send_command(
+                "keyPress", {"tabId": self._tab_id, "key": "a", "modifiers": 4}
+            )
             await asyncio.sleep(0.05)
-            await self._bridge.send_command("keyPress", {"tabId": self._tab_id, "key": "Backspace"})
+            await self._bridge.send_command(
+                "keyPress", {"tabId": self._tab_id, "key": "Backspace"}
+            )
             await asyncio.sleep(0.05)
-            await self._bridge.send_command("type", {"tabId": self._tab_id, "text": text})
+            await self._bridge.send_command(
+                "type", {"tabId": self._tab_id, "text": text}
+            )
         else:
-            raise ConnectionError("Extension bridge not connected, cannot fill with trusted events")
+            raise ConnectionError(
+                "Extension bridge not connected, cannot fill with trusted events"
+            )
 
     async def screenshot(self, path: Optional[str] = None) -> bytes:
         if self._bridge and self._bridge.is_connected:
             result = await self._bridge.send_command("screenshot", {})
             if result and result.get("dataUrl"):
-                b64 = result["dataUrl"].split(",", 1)[1] if "," in result["dataUrl"] else result["dataUrl"]
+                b64 = (
+                    result["dataUrl"].split(",", 1)[1]
+                    if "," in result["dataUrl"]
+                    else result["dataUrl"]
+                )
                 data = base64.b64decode(b64)
                 if path:
                     with open(path, "wb") as f:
@@ -729,7 +767,11 @@ class RDPPage:
                 return b""
             sa = ScreenshotActor(self._client, sa_id)
             result = sa.capture(self._browsing_context_id or 0)
-            b64_data = result.get("value", {}).get("data", "") if isinstance(result.get("value"), dict) else result.get("value", "")
+            b64_data = (
+                result.get("value", {}).get("data", "")
+                if isinstance(result.get("value"), dict)
+                else result.get("value", "")
+            )
             if isinstance(b64_data, str) and b64_data:
                 b64_data = b64_data.replace("data:image/png;base64,", "")
                 return base64.b64decode(b64_data)
@@ -786,7 +828,9 @@ class RDPPage:
             await self._bridge.send_command("clearCaptures", {})
         return responses
 
-    async def wait_for_response(self, url_pattern: str, timeout: float = 30.0) -> Optional[dict]:
+    async def wait_for_response(
+        self, url_pattern: str, timeout: float = 30.0
+    ) -> Optional[dict]:
         """Wait until a captured response matching url_pattern appears.
         Returns the response dict {url, body, timestamp} or None on timeout."""
         deadline = time.time() + timeout
@@ -823,15 +867,15 @@ class RDPPage:
         if not self._bridge or not self._bridge.is_connected:
             return []
         since = getattr(self, "_spy_ts", 0)
-        result = await self._bridge.send_command(
-            "getSpiedRequests", {"since": since}
-        )
+        result = await self._bridge.send_command("getSpiedRequests", {"since": since})
         requests = result.get("requests", []) if result else []
         if clear and requests:
             await self._bridge.send_command("clearSpied", {})
         return requests
 
-    async def wait_for_load_state(self, state: str = "load", timeout: int = 30000) -> None:
+    async def wait_for_load_state(
+        self, state: str = "load", timeout: int = 30000
+    ) -> None:
         # Quick check: already at target state?
         target = "complete" if state in ("load", "networkidle") else "interactive"
         try:
@@ -848,8 +892,31 @@ class RDPPage:
         target = tab.get_target()
         return target.get("memoryActor", "")
 
+    async def clear_cookies(self, domain: Optional[str] = None) -> int:
+        """Clear cookies via the WebExtension bridge.
+        Returns the number of cookies removed.
+        If domain is given, only cookies for that domain are removed.
+        """
+        if not self._bridge or not self._bridge.is_connected:
+            logger.warning("clear_cookies: bridge not connected")
+            return 0
+        params = {}
+        if domain:
+            params["domain"] = domain
+        try:
+            result = await self._bridge.send_command("clearCookies", params, timeout=10)
+            removed = result.get("removed", 0) if result else 0
+            logger.info(
+                f"Cleared {removed} cookies" + (f" for {domain}" if domain else "")
+            )
+            return removed
+        except Exception as e:
+            logger.error(f"clear_cookies failed: {e}")
+            return 0
+
     async def force_gc(self) -> None:
         """Force garbage + cycle collection on the current tab."""
+
         def _gc():
             actor_id = self._get_memory_actor_id()
             if not actor_id:
@@ -859,10 +926,12 @@ class RDPPage:
             mem.force_garbage_collection()
             mem.force_cycle_collection()
             mem.detach()
+
         await asyncio.to_thread(_gc)
 
     async def memory_usage(self) -> Optional[Dict]:
         """Return memory measurement for the current tab."""
+
         def _measure():
             actor_id = self._get_memory_actor_id()
             if not actor_id:
@@ -872,6 +941,7 @@ class RDPPage:
             result = mem.measure()
             mem.detach()
             return result
+
         return await asyncio.to_thread(_measure)
 
     async def wait_for_network_idle(
@@ -889,9 +959,7 @@ class RDPPage:
                 timer_handle[0].cancel()
                 timer_handle[0] = None
             if not pending:
-                timer_handle[0] = loop.call_later(
-                    idle_ms / 1000, idle_event.set
-                )
+                timer_handle[0] = loop.call_later(idle_ms / 1000, idle_event.set)
 
         def _on_available(data):
             actors = [
@@ -972,8 +1040,9 @@ class RDPPage:
             except Exception:
                 pass
 
-    async def wait_for_selector(self, selector: str, timeout: int = 30000,
-                                 state: str = "visible") -> Optional[Dict]:
+    async def wait_for_selector(
+        self, selector: str, timeout: int = 30000, state: str = "visible"
+    ) -> Optional[Dict]:
         """Wait for an element matching selector to appear/hide.
         Uses MutationObserver + lightweight global-variable poll.
         state: 'visible', 'attached', or 'hidden'.
@@ -981,7 +1050,7 @@ class RDPPage:
         sel_escaped = selector.replace("'", "\\'")
 
         # Use a namespaced store to avoid detectable global variable patterns
-        wfs_key = f"_s{int(time.time()*1000) % 100000}"
+        wfs_key = f"_s{int(time.time() * 1000) % 100000}"
 
         if state == "hidden":
             setup_js = (
@@ -998,7 +1067,11 @@ class RDPPage:
                 f"}})()"
             )
         else:
-            vis_check = "if(r.width===0&&r.height===0) return null;" if state == "visible" else ""
+            vis_check = (
+                "if(r.width===0&&r.height===0) return null;"
+                if state == "visible"
+                else ""
+            )
             setup_js = (
                 f"(function(){{"
                 f"  if(!window._ws)window._ws={{}};"
@@ -1029,7 +1102,9 @@ class RDPPage:
             try:
                 val = await self.evaluate(f"(window._ws||{{}})['{wfs_key}']")
                 if val and val != "null":
-                    await self.evaluate(f"try{{delete window._ws['{wfs_key}']}}catch(e){{}}")
+                    await self.evaluate(
+                        f"try{{delete window._ws['{wfs_key}']}}catch(e){{}}"
+                    )
                     if val == "timeout":
                         return None
                     if val == "ok":
@@ -1103,7 +1178,7 @@ class _Locator:
 
     async def wait_for(self, state: str = "visible", timeout: int = 5000) -> None:
         find_js = self._to_css_and_js()
-        wfs_key = f"_l{int(time.time()*1000) % 100000}"
+        wfs_key = f"_l{int(time.time() * 1000) % 100000}"
 
         if state == "hidden":
             setup_js = (
@@ -1119,7 +1194,11 @@ class _Locator:
                 f"}})()"
             )
         else:
-            vis = "if(r.width===0&&r.height===0) return null; " if state == "visible" else ""
+            vis = (
+                "if(r.width===0&&r.height===0) return null; "
+                if state == "visible"
+                else ""
+            )
             setup_js = (
                 f"(function(){{"
                 f"  if(!window._ws)window._ws={{}};"
@@ -1144,13 +1223,19 @@ class _Locator:
         while time.time() < deadline:
             val = await self._page.evaluate(f"(window._ws||{{}})['{wfs_key}']")
             if val and val != "null":
-                await self._page.evaluate(f"try{{delete window._ws['{wfs_key}']}}catch(e){{}}")
+                await self._page.evaluate(
+                    f"try{{delete window._ws['{wfs_key}']}}catch(e){{}}"
+                )
                 if val == "timeout":
-                    raise TimeoutError(f"Locator '{self._selector}' not {state} within {timeout}ms")
+                    raise TimeoutError(
+                        f"Locator '{self._selector}' not {state} within {timeout}ms"
+                    )
                 return
             await asyncio.sleep(0.1)
         try:
-            await self._page.evaluate(f"try{{delete window._ws['{wfs_key}']}}catch(e){{}}")
+            await self._page.evaluate(
+                f"try{{delete window._ws['{wfs_key}']}}catch(e){{}}"
+            )
         except Exception:
             pass
         raise TimeoutError(f"Locator '{self._selector}' not {state} within {timeout}ms")
@@ -1176,7 +1261,9 @@ class _Locator:
             except Exception:
                 pass
             await asyncio.sleep(0.3)
-        raise TimeoutError(f"Locator '{self._selector}' not clickable within {timeout}ms")
+        raise TimeoutError(
+            f"Locator '{self._selector}' not clickable within {timeout}ms"
+        )
 
     async def text_content(self) -> Optional[str]:
         find_js = self._to_css_and_js()
@@ -1209,18 +1296,26 @@ class _Locator:
         return result or 0
 
 
-from camoufox.humanize import generate_path as _generate_path, hover_delay as _hover_delay
+from camoufox.humanize import (
+    generate_path as _generate_path,
+    hover_delay as _hover_delay,
+)
 
 
 class _Mouse:
     def __init__(self, page: RDPPage):
         self._page = page
         import random as _r
+
         self._x: float = _r.uniform(300, 700)
         self._y: float = _r.uniform(200, 500)
 
     async def _raw_move(self, x: float, y: float) -> None:
-        if self._page._bridge and self._page._bridge.is_connected and self._page._tab_id is not None:
+        if (
+            self._page._bridge
+            and self._page._bridge.is_connected
+            and self._page._tab_id is not None
+        ):
             await self._page._bridge.send_command(
                 "moveTo", {"tabId": self._page._tab_id, "x": x, "y": y}
             )
@@ -1233,14 +1328,16 @@ class _Mouse:
             self._x, self._y = path[-1][0], path[-1][1]
 
     async def click(self, x: float, y: float, button: int = 0) -> None:
-        if self._page._bridge and self._page._bridge.is_connected and self._page._tab_id is not None:
+        if (
+            self._page._bridge
+            and self._page._bridge.is_connected
+            and self._page._tab_id is not None
+        ):
             await self._page._bridge.send_command(
                 "click", {"tabId": self._page._tab_id, "x": x, "y": y, "button": button}
             )
         else:
-            await self._page.evaluate(
-                f"document.elementFromPoint({x},{y})?.click()"
-            )
+            await self._page.evaluate(f"document.elementFromPoint({x},{y})?.click()")
 
     async def move(self, x: float, y: float) -> None:
         """Instant move (no animation). Use move_smooth() for human-like."""
@@ -1252,37 +1349,58 @@ class _Mouse:
         path = _generate_path(self._x, self._y, x, y, target_width)
         await self._follow_path(path)
 
-    async def click_smooth(self, x: float, y: float, button: int = 0,
-                           target_width: float = 50.0) -> None:
+    async def click_smooth(
+        self, x: float, y: float, button: int = 0, target_width: float = 50.0
+    ) -> None:
         """Human-like: move to target, hover delay, click."""
         await self.move_smooth(x, y, target_width)
         await asyncio.sleep(_hover_delay())
         await self.click(self._x, self._y, button)
 
     async def down(self, x: float, y: float, button: int = 0) -> None:
-        if self._page._bridge and self._page._bridge.is_connected and self._page._tab_id is not None:
+        if (
+            self._page._bridge
+            and self._page._bridge.is_connected
+            and self._page._tab_id is not None
+        ):
             await self._page._bridge.send_command(
-                "mouseDown", {"tabId": self._page._tab_id, "x": x, "y": y, "button": button}
+                "mouseDown",
+                {"tabId": self._page._tab_id, "x": x, "y": y, "button": button},
             )
 
     async def up(self, x: float, y: float, button: int = 0) -> None:
-        if self._page._bridge and self._page._bridge.is_connected and self._page._tab_id is not None:
+        if (
+            self._page._bridge
+            and self._page._bridge.is_connected
+            and self._page._tab_id is not None
+        ):
             await self._page._bridge.send_command(
-                "mouseUp", {"tabId": self._page._tab_id, "x": x, "y": y, "button": button}
+                "mouseUp",
+                {"tabId": self._page._tab_id, "x": x, "y": y, "button": button},
             )
 
     async def wheel(self, delta_x: float, delta_y: float) -> None:
         """Single wheel event. Use wheel_smooth() for human-like scrolling."""
-        if self._page._bridge and self._page._bridge.is_connected and self._page._tab_id is not None:
+        if (
+            self._page._bridge
+            and self._page._bridge.is_connected
+            and self._page._tab_id is not None
+        ):
             await self._page._bridge.send_command(
-                "scroll", {"tabId": self._page._tab_id,
-                           "x": self._x, "y": self._y,
-                           "deltaX": delta_x, "deltaY": delta_y}
+                "scroll",
+                {
+                    "tabId": self._page._tab_id,
+                    "x": self._x,
+                    "y": self._y,
+                    "deltaX": delta_x,
+                    "deltaY": delta_y,
+                },
             )
 
     async def wheel_smooth(self, delta_y: float) -> None:
         """Human-like scroll: bursts with momentum decay and reading pauses."""
         from camoufox.humanize import scroll_sequence
+
         events = scroll_sequence(delta_y)
         for dy, delay in events:
             if abs(dy) > 0.5:
@@ -1295,13 +1413,21 @@ class _Keyboard:
         self._page = page
 
     async def type(self, text: str) -> None:
-        if self._page._bridge and self._page._bridge.is_connected and self._page._tab_id is not None:
+        if (
+            self._page._bridge
+            and self._page._bridge.is_connected
+            and self._page._tab_id is not None
+        ):
             await self._page._bridge.send_command(
                 "type", {"tabId": self._page._tab_id, "text": text}
             )
 
     async def press(self, key: str) -> None:
-        if self._page._bridge and self._page._bridge.is_connected and self._page._tab_id is not None:
+        if (
+            self._page._bridge
+            and self._page._bridge.is_connected
+            and self._page._tab_id is not None
+        ):
             await self._page._bridge.send_command(
                 "keyPress", {"tabId": self._page._tab_id, "key": key}
             )
@@ -1315,6 +1441,7 @@ class RDPBrowser:
     Robust initialization: TCP port probe + retry logic eliminates
     race conditions when launching multiple instances.
     """
+
     # Limit concurrent browser initializations to avoid disk/CPU thrashing
     _init_semaphore: Optional[asyncio.Semaphore] = None
 
@@ -1379,8 +1506,9 @@ class RDPBrowser:
     async def __aexit__(self, *args) -> None:
         await self.close()
 
-    def _prepare_extension_with_proxy(self, proxy_host: str, proxy_port: int,
-                                      username: str, password: str) -> str:
+    def _prepare_extension_with_proxy(
+        self, proxy_host: str, proxy_port: int, username: str, password: str
+    ) -> str:
         """Copy extension to temp dir and inject proxy routing + auth."""
         ext_copy = os.path.join(self._profile_path, "_ext_with_proxy")
         if os.path.exists(ext_copy):
@@ -1391,42 +1519,41 @@ class RDPBrowser:
             content = f.read()
 
         proxy_js = (
-            f'let proxyConfig = {{\n'
+            f"let proxyConfig = {{\n"
             f'  host: "{proxy_host}",\n'
-            f'  port: {proxy_port}\n'
-            f'}};\n'
+            f"  port: {proxy_port}\n"
+            f"}};\n"
             f'let proxyCredentials = {{ username: "{username}", password: "{password}" }};\n'
-            f'\n'
-            f'browser.proxy.onRequest.addListener(\n'
-            f'  (details) => {{\n'
+            f"\n"
+            f"browser.proxy.onRequest.addListener(\n"
+            f"  (details) => {{\n"
             f'    if (details.url.startsWith("ws://127.0.0.1") ||\n'
             f'        details.url.startsWith("http://127.0.0.1") ||\n'
             f'        details.url.startsWith("http://localhost")) {{\n'
             f'      return {{ type: "direct" }};\n'
-            f'    }}\n'
-            f'    return {{\n'
+            f"    }}\n"
+            f"    return {{\n"
             f'      type: "http",\n'
-            f'      host: proxyConfig.host,\n'
-            f'      port: proxyConfig.port\n'
-            f'    }};\n'
-            f'  }},\n'
+            f"      host: proxyConfig.host,\n"
+            f"      port: proxyConfig.port\n"
+            f"    }};\n"
+            f"  }},\n"
             f'  {{ urls: ["<all_urls>"] }}\n'
-            f');\n'
-            f'\n'
-            f'browser.webRequest.onAuthRequired.addListener(\n'
-            f'  (details) => {{\n'
-            f'    if (details.isProxy && proxyCredentials) {{\n'
-            f'      return {{ authCredentials: proxyCredentials }};\n'
-            f'    }}\n'
-            f'  }},\n'
+            f");\n"
+            f"\n"
+            f"browser.webRequest.onAuthRequired.addListener(\n"
+            f"  (details) => {{\n"
+            f"    if (details.isProxy && proxyCredentials) {{\n"
+            f"      return {{ authCredentials: proxyCredentials }};\n"
+            f"    }}\n"
+            f"  }},\n"
             f'  {{ urls: ["<all_urls>"] }},\n'
             f'  ["blocking"]\n'
-            f');\n'
+            f");\n"
         )
 
         content = content.replace(
-            "let proxyConfig = null;\nlet proxyCredentials = null;",
-            proxy_js
+            "let proxyConfig = null;\nlet proxyCredentials = null;", proxy_js
         )
         with open(bg_path, "w", encoding="utf-8") as f:
             f.write(content)
@@ -1482,8 +1609,10 @@ class RDPBrowser:
             proxy_port = parsed.port or 8080
             if self._proxy.get("username"):
                 self._extension_dir = self._prepare_extension_with_proxy(
-                    proxy_host, proxy_port,
-                    self._proxy["username"], self._proxy.get("password", "")
+                    proxy_host,
+                    proxy_port,
+                    self._proxy["username"],
+                    self._proxy.get("password", ""),
                 )
             else:
                 prefs["network.proxy.type"] = 1
@@ -1501,7 +1630,8 @@ class RDPBrowser:
             "--new-instance",
             "--no-remote",
             f"--start-debugger-server={self._rdp_port}",
-            "--profile", self._profile_path,
+            "--profile",
+            self._profile_path,
             f"--width={self._viewport['width']}",
             f"--height={self._viewport['height']}",
         ]
@@ -1514,12 +1644,13 @@ class RDPBrowser:
         env = os.environ.copy()
         if self._fingerprint:
             # Full fingerprint config: strip _meta, chunk for Windows env var limit
-            fp_config = {k: v for k, v in self._fingerprint.items()
-                         if not k.startswith("_")}
+            fp_config = {
+                k: v for k, v in self._fingerprint.items() if not k.startswith("_")
+            }
             config_str = json.dumps(fp_config)
             chunk_size = 2047
             for i in range(0, len(config_str), chunk_size):
-                chunk = config_str[i:i + chunk_size]
+                chunk = config_str[i : i + chunk_size]
                 env[f"CAMOU_CONFIG_{(i // chunk_size) + 1}"] = chunk
             if self._timezone:
                 env["TZ"] = self._timezone
@@ -1586,7 +1717,9 @@ class RDPBrowser:
                 if attempt < max_retries:
                     await asyncio.sleep(1.0 * attempt)
                 else:
-                    logger.warning(f"Extension install failed after {max_retries} attempts: {e}")
+                    logger.warning(
+                        f"Extension install failed after {max_retries} attempts: {e}"
+                    )
 
     async def _wait_for_bridge(self, timeout: float = 10.0) -> None:
         """Wait for the extension WebSocket bridge to connect."""
@@ -1623,9 +1756,9 @@ class RDPBrowser:
 
     def _read_stderr(self) -> str:
         try:
-            if hasattr(self, '_stderr_file') and self._stderr_file:
+            if hasattr(self, "_stderr_file") and self._stderr_file:
                 self._stderr_file.flush()
-                with open(self._stderr_file.name, 'r', errors='replace') as f:
+                with open(self._stderr_file.name, "r", errors="replace") as f:
                     return f.read()[-1000:]
         except Exception:
             pass
@@ -1657,7 +1790,9 @@ class RDPBrowser:
                     tab_id = None
                     if self._bridge and self._bridge.is_connected:
                         try:
-                            result = await self._bridge.send_command("getActiveTab", {}, timeout=3)
+                            result = await self._bridge.send_command(
+                                "getActiveTab", {}, timeout=3
+                            )
                             if result:
                                 tab_id = result.get("tabId")
                         except Exception:

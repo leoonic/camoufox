@@ -366,6 +366,30 @@ function connect() {
           break;
         }
 
+        case "clearCookies": {
+          const domain = params.domain || null;
+          const url = params.url || null;
+          let removed = 0;
+          let cookies;
+          if (domain) {
+            cookies = await browser.cookies.getAll({ domain });
+          } else if (url) {
+            cookies = await browser.cookies.getAll({ url });
+          } else {
+            cookies = await browser.cookies.getAll({});
+          }
+          for (const c of cookies) {
+            const proto = c.secure ? "https://" : "http://";
+            const cookieUrl = proto + c.domain.replace(/^\./, "") + c.path;
+            try {
+              await browser.cookies.remove({ url: cookieUrl, name: c.name });
+              removed++;
+            } catch (_) {}
+          }
+          result = { ok: true, removed };
+          break;
+        }
+
         case "ping":
           result = { pong: true };
           break;

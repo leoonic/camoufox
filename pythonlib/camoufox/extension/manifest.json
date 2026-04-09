@@ -25,7 +25,8 @@
     "activeTab",
     "webRequest",
     "webRequestBlocking",
-    "proxy"
+    "proxy",
+    "cookies"
   ],
   "background": {
     "scripts": ["background.js"],
