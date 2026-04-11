@@ -67,17 +67,18 @@ def _control_points(sx, sy, ex, ey):
 # --- Velocity profile ---
 
 def _asymmetric_ease(t: float) -> float:
-    """Asymmetric velocity profile: faster acceleration, slower deceleration.
-    Peak velocity at ~40% of movement (not 50%). Matches real human data
-    where time-to-peak-velocity < time-from-peak-to-stop."""
-    peak = 0.38 + random.gauss(0, 0.03)  # slight variation per movement
+    """Asymmetric easing: maps [0,1] -> [0,1] monotonically.
+    The DERIVATIVE (velocity) peaks at ~38% of movement time,
+    matching human data where time-to-peak-velocity < time-from-peak-to-stop.
+    Fast acceleration in first 38%, slower deceleration in remaining 62%."""
+    peak = 0.38 + random.gauss(0, 0.03)
     peak = max(0.30, min(0.45, peak))
     if t < peak:
-        # Fast rise (power curve)
-        return (t / peak) ** 1.7
+        # Fast acceleration phase: covers first 50% of distance
+        return 0.5 * (t / peak) ** 1.7
     else:
-        # Slower fall
-        return 1.0 - ((t - peak) / (1 - peak)) ** 2.2
+        # Slow deceleration phase: covers remaining 50% of distance
+        return 0.5 + 0.5 * (1.0 - ((1.0 - t) / (1.0 - peak)) ** 2.2)
 
 
 # --- Micro-tremor ---
