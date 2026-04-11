@@ -123,7 +123,7 @@ index xxxxxxxxxx..yyyyyyyyyy 100644
 @@ -534,5 +534,13 @@
      "nsPluginArray.cpp",
  ]
-
+ 
 +# CanvasFingerprintManager compiled separately to avoid unified build scope issues
 +# (includes RoverfoxStorageManager.h which can affect compilation units)
 +SOURCES += ["CanvasFingerprintManager.cpp"]
@@ -139,9 +139,9 @@ index xxxxxxxxxx..yyyyyyyyyy 100644
 --- a/dom/base/nsGlobalWindowInner.h
 +++ b/dom/base/nsGlobalWindowInner.h
 @@ -685,6 +685,9 @@
-
+ 
    void ForgetSharedWorker(mozilla::dom::SharedWorker* aSharedWorker);
-
+ 
 +  // Per-context canvas fingerprint seed
 +  void SetCanvasSeed(uint32_t seed, mozilla::ErrorResult& aRv);
 +
@@ -163,7 +163,7 @@ index xxxxxxxxxx..yyyyyyyyyy 100644
 @@ -7477,6 +7478,28 @@ void nsGlobalWindowInner::ForgetSharedWorker(SharedWorker* aSharedWorker) {
    mSharedWorkers.RemoveElement(aSharedWorker);
  }
-
+ 
 +
 +void nsGlobalWindowInner::SetCanvasSeed(uint32_t seed, ErrorResult& aRv) {
 +  uint32_t userContextId = 0;
@@ -214,7 +214,7 @@ index xxxxxxxxxx..yyyyyyyyyy 100644
 @@ -2287,5 +2289,34 @@
          SurfaceFormat::A8R8G8B8_UINT32);
    }
-
+ 
 +  // Per-context canvas fingerprint noise
 +  if (ret) {
 +    uint32_t userContextId = 0;
@@ -248,7 +248,7 @@ index xxxxxxxxxx..yyyyyyyyyy 100644
  }
 @@ -6615,5 +6644,37 @@
    } while (false);
-
+ 
 +  // Per-context canvas fingerprint noise
 +  {
 +    uint32_t userContextId = 0;
@@ -291,7 +291,7 @@ index xxxxxxxxxx..yyyyyyyyyy 100644
 @@ -188,6 +188,9 @@ SOURCES += [
  # Suppress warnings from third-party code.
  SOURCES["MurmurHash3.cpp"].flags += ["-Wno-implicit-fallthrough"]
-
+ 
 +# WorkerPrivate.h for OffscreenCanvas worker context support
 +LOCAL_INCLUDES += ["/dom/workers"]
 +
@@ -305,7 +305,7 @@ index xxxxxxxxxx..yyyyyyyyyy 100644
 @@ -892,6 +892,12 @@ partial interface Window {
    readonly attribute VisualViewport visualViewport;
  };
-
+ 
 +// Per-context canvas fingerprint seed
 +partial interface Window {
 +  [Throws, Func="mozilla::dom::CanvasFingerprintManager::IsFunctionEnabledForWebIDL"]

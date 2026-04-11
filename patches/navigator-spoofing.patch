@@ -235,7 +235,7 @@ index 318d2edba8..12feb91573 100644
 +    }
 +  }
    nsCOMPtr<nsPIDOMWindowInner> window;
-
+ 
    if (mWindow) {
 @@ -308,6 +336,11 @@ void Navigator::GetAppCodeName(nsAString& aAppCodeName, ErrorResult& aRv) {
  
@@ -250,7 +250,7 @@ index 318d2edba8..12feb91573 100644
  
    nsresult rv = GetAppVersion(
 @@ -423,6 +456,24 @@
-
+ 
  void Navigator::GetPlatform(nsAString& aPlatform, CallerType aCallerType,
                              ErrorResult& aRv) const {
 +  EnsureGlobalTimezoneInitialized();

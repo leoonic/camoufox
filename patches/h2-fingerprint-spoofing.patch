@@ -1,14 +1,15 @@
 diff --git a/netwerk/protocol/http/Http2Session.h b/netwerk/protocol/http/Http2Session.h
 --- a/netwerk/protocol/http/Http2Session.h
 +++ b/netwerk/protocol/http/Http2Session.h
-@@ -50,6 +50,7 @@ enum {
-   SETTINGS_TYPE_INITIAL_WINDOW = 4,
-   SETTINGS_TYPE_MAX_FRAME_SIZE = 5,
-   SETTINGS_TYPE_ENABLE_CONNECT_PROTOCOL = 8,
-+  SETTINGS_TYPE_MAX_HEADER_LIST_SIZE = 6,
-   SETTINGS_NO_RFC7540_PRIORITIES = 9,
- };
-
+@@ -180,6 +180,7 @@ class Http2Session : public ASpdySession {
+    SETTINGS_TYPE_INITIAL_WINDOW = 4,
+    // max frame size settings sender allows receipt of
+    SETTINGS_TYPE_MAX_FRAME_SIZE = 5,
++   SETTINGS_TYPE_MAX_HEADER_LIST_SIZE = 6,
+    // 6 is SETTINGS_TYPE_MAX_HEADER_LIST - advisory, we ignore it
+    // 7 is unassigned
+    // if sender implements extended CONNECT
+ 
 diff --git a/netwerk/protocol/http/Http2Session.cpp b/netwerk/protocol/http/Http2Session.cpp
 --- a/netwerk/protocol/http/Http2Session.cpp
 +++ b/netwerk/protocol/http/Http2Session.cpp
@@ -17,51 +18,46 @@ diff --git a/netwerk/protocol/http/Http2Session.cpp b/netwerk/protocol/http/Http
  #include "Http2Stream.h"
  #include "Http2Push.h"
 +#include "MaskConfig.hpp"
-
+ 
  #include "mozilla/EndianUtils.h"
  #include "mozilla/Telemetry.h"
 @@ -1040,7 +1041,7 @@ void Http2Session::SendHello() {
    LOG3(("Http2Session::SendHello %p\n", this));
-
+ 
    // 24 is the minimum size of the SETTINGS frame
 -  static const uint32_t maxSettings = 6;
 +  static const uint32_t maxSettings = 8;
    static const uint32_t prioritySize =
        kPriorityGroupCount * (kFrameHeaderBytes + 5);
    static const uint32_t maxDataLen =
-@@ -1056,8 +1057,12 @@ void Http2Session::SendHello() {
-
-   uint8_t numberOfEntries = 0;
-
--  // SETTING 1: HEADER_TABLE_SIZE
+@@ -1072,5 +1073,9 @@ void Http2Session::SendHello() {
+   // Let the other endpoint know about our default HPACK decompress table size
 -  uint32_t maxHpackBufferSize = gHttpHandler->DefaultHpackBuffer();
 +  // Camoufox: configurable HTTP/2 fingerprint
 +  auto cfgHeaderTableSize = MaskConfig::GetUint64("h2:headerTableSize");
 +  uint32_t maxHpackBufferSize = cfgHeaderTableSize
 +      ? static_cast<uint32_t>(cfgHeaderTableSize.value())
 +      : gHttpHandler->DefaultHpackBuffer();
-+
    mDecompressor.SetInitialMaxBufferSize(maxHpackBufferSize);
    NetworkEndian::writeUint16(packet + kFrameHeaderBytes + (6 * numberOfEntries),
-       SETTINGS_TYPE_HEADER_TABLE_SIZE);
-@@ -1066,26 +1071,47 @@ void Http2Session::SendHello() {
-       maxHpackBufferSize);
-   numberOfEntries++;
-
--  // SETTING 2: ENABLE_PUSH (value 0 -- push disabled)
+                              SETTINGS_TYPE_HEADER_TABLE_SIZE);
+@@ -1082,25 +1087,39 @@ void Http2Session::SendHello() {
+-  // We don't support HTTP/2 Push. Set SETTINGS_TYPE_ENABLE_PUSH to 0
 +  // Camoufox: configurable ENABLE_PUSH
 +  auto cfgEnablePush = MaskConfig::GetUint64("h2:enablePush");
    NetworkEndian::writeUint16(packet + kFrameHeaderBytes + (6 * numberOfEntries),
-       SETTINGS_TYPE_ENABLE_PUSH);
--  // value is 0 because memset zeroed the buffer
+                              SETTINGS_TYPE_ENABLE_PUSH);
+-  // The value portion of the setting pair is already initialized to 0
 +  if (cfgEnablePush) {
 +    NetworkEndian::writeUint32(
 +        packet + kFrameHeaderBytes + (6 * numberOfEntries) + 2,
 +        static_cast<uint32_t>(cfgEnablePush.value()));
 +  }
    numberOfEntries++;
-
--  // SETTING 3: MAX_CONCURRENT_STREAMS
+ 
+-  // We might also want to set the SETTINGS_TYPE_MAX_CONCURRENT to 0
+-  // to indicate that we don't support any incoming push streams,
+-  // but some websites panic when we do that, so we don't by default.
 -  if (StaticPrefs::network_http_http2_send_push_max_concurrent_frame()) {
 +  // Camoufox: configurable MAX_CONCURRENT_STREAMS
 +  auto cfgMaxConcurrent = MaskConfig::GetUint64("h2:maxConcurrentStreams");
@@ -69,7 +65,7 @@ diff --git a/netwerk/protocol/http/Http2Session.cpp b/netwerk/protocol/http/Http
      NetworkEndian::writeUint16(
          packet + kFrameHeaderBytes + (6 * numberOfEntries),
          SETTINGS_TYPE_MAX_CONCURRENT);
--    // value is 0 (from memset)
+-    // The value portion of the setting pair is already initialized to 0
 +    NetworkEndian::writeUint32(
 +        packet + kFrameHeaderBytes + (6 * numberOfEntries) + 2,
 +        static_cast<uint32_t>(cfgMaxConcurrent.value()));
@@ -80,27 +76,26 @@ diff --git a/netwerk/protocol/http/Http2Session.cpp b/netwerk/protocol/http/Http
 +        SETTINGS_TYPE_MAX_CONCURRENT);
      numberOfEntries++;
    }
-
    mWaitingForSettingsAck = true;
-
--  // SETTING 4: INITIAL_WINDOW_SIZE
+ 
+-  // Advertise the Push RWIN for the session, and on each new pull stream
+-  // send a window update
 +  // Camoufox: configurable INITIAL_WINDOW_SIZE
 +  auto cfgInitialWindow = MaskConfig::GetUint64("h2:initialWindowSize");
 +  uint32_t initialWindowValue = cfgInitialWindow
 +      ? static_cast<uint32_t>(cfgInitialWindow.value())
 +      : mPushAllowance;
    NetworkEndian::writeUint16(packet + kFrameHeaderBytes + (6 * numberOfEntries),
-       SETTINGS_TYPE_INITIAL_WINDOW);
+                              SETTINGS_TYPE_INITIAL_WINDOW);
    NetworkEndian::writeUint32(
 -      packet + kFrameHeaderBytes + (6 * numberOfEntries) + 2, mPushAllowance);
 +      packet + kFrameHeaderBytes + (6 * numberOfEntries) + 2, initialWindowValue);
    numberOfEntries++;
-
-   // SETTING 5: MAX_FRAME_SIZE
-@@ -1095,6 +1121,17 @@ void Http2Session::SendHello() {
+@@ -1112,6 +1131,18 @@ void Http2Session::SendHello() {
+   NetworkEndian::writeUint32(
        packet + kFrameHeaderBytes + (6 * numberOfEntries) + 2, kMaxFrameData);
    numberOfEntries++;
-
+ 
 +  // Camoufox: optional MAX_HEADER_LIST_SIZE (Chrome sends 262144)
 +  auto cfgMaxHeaderListSize = MaskConfig::GetUint64("h2:maxHeaderListSize");
 +  if (cfgMaxHeaderListSize) {
@@ -113,33 +108,32 @@ diff --git a/netwerk/protocol/http/Http2Session.cpp b/netwerk/protocol/http/Http
 +    numberOfEntries++;
 +  }
 +
-   // SETTING 6 (conditional): NO_RFC7540_PRIORITIES
    bool disableRFC7540Priorities =
        !StaticPrefs::network_http_http2_enabled_deps() ||
-@@ -1117,7 +1154,11 @@ void Http2Session::SendHello() {
+@@ -1137,7 +1168,12 @@ void Http2Session::SendHello() {
    LogIO(this, nullptr, "Generate Settings", packet,
-       kFrameHeaderBytes + dataLen);
-
--  // WINDOW_UPDATE for session (stream 0)
+         kFrameHeaderBytes + dataLen);
+ 
 +  // Camoufox: configurable WINDOW_UPDATE size
 +  auto cfgWindowUpdate = MaskConfig::GetUint64("h2:windowUpdateSize");
 +  if (cfgWindowUpdate) {
 +    mInitialRwin = static_cast<uint32_t>(cfgWindowUpdate.value()) + kDefaultRwin;
 +  }
+   // now bump the local session window from 64KB
    uint32_t sessionWindowBump = mInitialRwin - kDefaultRwin;
    if (kDefaultRwin < mInitialRwin) {
-     mLocalSessionWindow = mInitialRwin;
-@@ -1131,7 +1172,9 @@ void Http2Session::SendHello() {
+     // send a window update for the session (Stream 0) for something large
+@@ -1154,7 +1190,9 @@ void Http2Session::SendHello() {
    }
-
-   // PRIORITY frames (dependency tree)
+ 
 -  if (!disableRFC7540Priorities) {
 +  // Camoufox: allow disabling priority frames (Chrome doesn't send them)
-+  bool cfgDisablePriority = MaskConfig::GetBool("h2:disablePriority", false);
++  bool cfgDisablePriority = MaskConfig::CheckBool("h2:disablePriority");
 +  if (!disableRFC7540Priorities && !cfgDisablePriority) {
      mUseH2Deps = true;
      MOZ_ASSERT(mNextStreamID == kLeaderGroupID);
      CreatePriorityNode(kLeaderGroupID, 0, 200, "leader");
+     mNextStreamID += 2;
 diff --git a/netwerk/protocol/http/Http2Compression.cpp b/netwerk/protocol/http/Http2Compression.cpp
 --- a/netwerk/protocol/http/Http2Compression.cpp
 +++ b/netwerk/protocol/http/Http2Compression.cpp
@@ -148,10 +142,10 @@ diff --git a/netwerk/protocol/http/Http2Compression.cpp b/netwerk/protocol/http/
  #include "Http2HuffmanIncoming.h"
  #include "Http2HuffmanOutgoing.h"
 +#include "MaskConfig.hpp"
-
+ 
  #include "mozilla/StaticPrefs_network.h"
  #include "mozilla/Telemetry.h"
-@@ -1000,10 +1001,31 @@ nsresult Http2Compressor::EncodeHeaderBlock(
+@@ -1053,15 +1054,32 @@ nsresult Http2Compressor::EncodeHeaderBlock(
    // colon headers first
    if (!simpleConnectForm) {
 -    ProcessHeader(nvPair(":method"_ns, method), false, false);
@@ -179,6 +173,12 @@ diff --git a/netwerk/protocol/http/Http2Compression.cpp b/netwerk/protocol/http/
 +          break;
 +      }
 +    }
+     if (isWebsocket) {
+       ProcessHeader(nvPair(":protocol"_ns, protocol), false, false);
+     }
+   } else {
+     ProcessHeader(nvPair(":method"_ns, method), false, false);
+     ProcessHeader(nvPair(":authority"_ns, host), false, false);
    }
-
-   // All the rest of the headers go out in the order they were read
+ 
+   // now the non colon headers

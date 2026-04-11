@@ -40,22 +40,22 @@ index d0aebdf965..01472ec205 100644
      return mSpoofedUserAgent;
 @@ -2077,6 +2087,10 @@ nsresult nsHttpHandler::SetAcceptLanguages() {
    }
-
+ 
    MOZ_ASSERT(NS_IsMainThread());
 +  if (auto value = MaskConfig::GetString("headers.Accept-Language")) {
 +    mAcceptLanguages.Assign(nsCString(value.value().c_str()));
 +    return NS_OK;
 +  }
-
+ 
    mAcceptLanguagesIsDirty = false;
-
-@@ -2098,11 +2112,19 @@ nsresult nsHttpHandler::SetAcceptLanguages() {
-
+ 
+@@ -2123,17 +2123,25 @@ nsresult nsHttpHandler::SetAcceptLanguages() {
+ 
  nsresult nsHttpHandler::SetAcceptEncodings(const char* aAcceptEncodings,
                                             bool isSecure, bool isDictionary) {
    if (isDictionary) {
-    mDictionaryAcceptEncodings = aAcceptEncodings;
-  } else if (isSecure) {
+     mDictionaryAcceptEncodings = aAcceptEncodings;
+   } else if (isSecure) {
 +    if (auto value = MaskConfig::GetString("headers.Accept-Encoding")) {
 +      mHttpsAcceptEncodings.Assign(nsCString(value.value().c_str()));
 +    } else {
@@ -65,8 +65,13 @@ index d0aebdf965..01472ec205 100644
 +    if (auto value = MaskConfig::GetString("headers.Accept-Encoding")) {
 +      mHttpAcceptEncodings.Assign(nsCString(value.value().c_str()));
 +    } else {
+     // use legacy list if a secure override is not specified
      mHttpAcceptEncodings = aAcceptEncodings;
+     if (mHttpsAcceptEncodings.IsEmpty()) {
+       mHttpsAcceptEncodings = aAcceptEncodings;
+     }
 +    }
    }
+ 
    return NS_OK;
  }

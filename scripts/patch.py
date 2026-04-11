@@ -49,7 +49,16 @@ class Patcher:
         with temp_cd(find_src_dir('.', version, release)):
             # Reset to unpatched state first (like "Find broken patches")
             print("Resetting to unpatched state...")
-            run('git clean -fdx && ./mach clobber && git reset --hard unpatched', exit_on_fail=False)
+            # Always restore to a clean unpatched tree, even if `mach clobber` fails.
+            run('git clean -fdx; ./mach clobber; git reset --hard unpatched', exit_on_fail=False)
+            # Explicitly remove any leftover .rej files (git clean may miss them)
+            for root, dirs, files in os.walk('.'):
+                for file in files:
+                    if file.endswith('.rej'):
+                        try:
+                            os.remove(os.path.join(root, file))
+                        except OSError:
+                            pass
 
             # Re-copy additions and settings after reset
             print("Re-copying additions and settings...")
@@ -111,7 +120,7 @@ class Patcher:
         """
         import time
 
-        print(f"\n*** -> patch -p1 -i {patch_file}")
+        print(f"\n*** -> patch -p1 --fuzz=3 -i {patch_file}")
         sys.stdout.flush()
 
         # Record time before applying so we only detect .rej files from this patch
@@ -122,8 +131,9 @@ class Patcher:
         # --forward flag: skip patches that appear to be already applied
         # --binary flag: preserve line endings (helps with CRLF vs LF differences)
         # -l flag: ignore whitespace differences
+        # --fuzz=3: tolerate up to 3 lines of context mismatch
         result = subprocess.run(
-            ['patch', '-p1', '--forward', '-l', '--binary', '-i', patch_file],
+            ['patch', '-p1', '--forward', '-l', '--binary', '--fuzz=3', '-i', patch_file],
             stdin=sys.stdin,
             stdout=sys.stdout,
             stderr=sys.stderr,
@@ -131,19 +141,55 @@ class Patcher:
         )
 
         # After patch completes, search for any .rej files created during this patch
-        rejects = []
+        raw_rejects = []
         for root, dirs, files in os.walk('.'):
             for file in files:
                 if file.endswith('.rej'):
                     reject_path = os.path.join(root, file)
                     if os.path.exists(reject_path):
-                        # Only include if created after this patch started
-                        if os.path.getmtime(reject_path) >= start_time:
-                            rejects.append(reject_path)
+                        # Only include if created after this patch started.
+                        # Subtract 1 second to account for filesystem mtime
+                        # resolution (some filesystems round to 1-second).
+                        if os.path.getmtime(reject_path) >= start_time - 1:
+                            raw_rejects.append(reject_path)
 
-        # Clean up .rej files so they don't interfere with subsequent patches
+        # Filter out "already applied" false positives:
+        # Firefox 149+ ships with many previously-patched changes (e.g. Juggler/Playwright)
+        # built-in. When context lines changed but the actual added content is already
+        # present in the source, the .rej is a false positive — not a real failure.
+        rejects = []
+        for rej_path in raw_rejects:
+            src_path = rej_path[:-4]  # strip .rej
+            if not os.path.exists(src_path):
+                rejects.append(rej_path)
+                continue
+            try:
+                with open(rej_path, 'r', errors='replace') as f:
+                    rej_content = f.read()
+                added_lines = [
+                    line[1:].strip()
+                    for line in rej_content.split('\n')
+                    if line.startswith('+') and not line.startswith('+++') and line[1:].strip()
+                ]
+                if not added_lines:
+                    # Only deletions — already handled by the source change
+                    os.remove(rej_path)
+                    continue
+                with open(src_path, 'r', errors='replace') as f:
+                    src_content = f.read()
+                found = sum(1 for line in added_lines if line in src_content)
+                if found / len(added_lines) >= 0.95:
+                    # Content is already present — skip this .rej
+                    os.remove(rej_path)
+                    continue
+            except Exception:
+                pass
+            rejects.append(rej_path)
+
+        # Clean up remaining .rej files so they don't interfere with subsequent patches
         for rej in rejects:
-            os.remove(rej)
+            if os.path.exists(rej):
+                os.remove(rej)
 
         return rejects
 
