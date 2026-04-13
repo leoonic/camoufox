@@ -126,8 +126,19 @@ class Patcher:
                     },
                     'h2-fingerprint-spoofing.patch': {
                         # z-v149-fixup-06 adds SETTINGS_TYPE_MAX_HEADER_LIST_SIZE
-                        # via a different anchor in Http2Session.h.
+                        # via a different anchor in Http2Session.h, plus all the
+                        # Http2Session.cpp and Http2Compression.cpp changes via
+                        # its own content-aware substitutions.
                         'netwerk/protocol/http/Http2Session.h.rej',
+                        'netwerk/protocol/http/Http2Session.cpp.rej',
+                    },
+                    'anti-font-fingerprinting.patch': {
+                        # Hunk #2 of nsMathMLChar.cpp targets
+                        # nsPropertiesTable::MakeTextRun which no longer exists
+                        # in FF149 (renamed to nsUnicodeTable). The default
+                        # parameter value of 0 for aUserContextId makes the
+                        # existing caller compile without update.
+                        'layout/mathml/nsMathMLChar.cpp.rej',
                     },
                 }
 

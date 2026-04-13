@@ -30,17 +30,6 @@
      }
    }
  
---- a/layout/mathml/nsMathMLChar.cpp
-+++ b/layout/mathml/nsMathMLChar.cpp
-@@ -273,7 +273,7 @@
-                "nsUnicodeTable can only access glyphs by code point");
-   return aFontGroup->MakeTextRun(&aGlyph.code, 1, aDrawTarget,
-                                  aAppUnitsPerDevPixel, gfx::ShapedTextFlags(),
--                                 nsTextFrameUtils::Flags(), nullptr);
-+                                 nsTextFrameUtils::Flags(), nullptr, 0); // TODO: Extract private browsing ID
- }
- 
- // An instance of nsOpenTypeTable is associated with one gfxFontEntry that
 --- a/gfx/thebes/gfxPlatformFontList.cpp
 +++ b/gfx/thebes/gfxPlatformFontList.cpp
 @@ -460,6 +460,7 @@

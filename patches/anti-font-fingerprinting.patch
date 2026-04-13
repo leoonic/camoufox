@@ -862,7 +862,7 @@ index 1a5bdaba99..46226fc88d 100644
  
  #include <algorithm>
  
-@@ -1567,6 +1571,41 @@ bool gfxHarfBuzzShaper::ShapeText(DrawTarget* aDrawTarget,
+@@ -1567,6 +1571,37 @@ bool gfxHarfBuzzShaper::ShapeText(DrawTarget* aDrawTarget,
  
    hb_shape(mHBFont, mBuffer, features.Elements(), features.Length());
  
@@ -900,7 +900,7 @@ index 1a5bdaba99..46226fc88d 100644
    if (isRightToLeft) {
      hb_buffer_reverse(mBuffer);
    }
-@@ -1872,3 +1911,4 @@ nsresult gfxHarfBuzzShaper::SetGlyphsFromRun(gfxShapedText* aShapedText,
+@@ -1872,3 +1907,4 @@ nsresult gfxHarfBuzzShaper::SetGlyphsFromRun(gfxShapedText* aShapedText,
  
    return NS_OK;
  }
@@ -1010,7 +1010,7 @@ index de9a9661a1..f878bdb36c 100644
    if (aLength == 0) {
      return MakeEmptyTextRun(aParams, aFlags, aFlags2);
    }
-@@ -2530,8 +2547,16 @@ already_AddRefed<gfxTextRun> gfxFontGroup::MakeTextRun(
+@@ -2530,8 +2547,14 @@ already_AddRefed<gfxTextRun> gfxFontGroup::MakeTextRun(
      return MakeBlankTextRun(aString, aLength, aParams, aFlags, aFlags2);
    }
  
@@ -1026,7 +1026,7 @@ index de9a9661a1..f878bdb36c 100644
    if (!textRun) {
      return nullptr;
    }
-@@ -2547,11 +2572,11 @@ already_AddRefed<gfxTextRun> gfxFontGroup::MakeTextRun(
+@@ -2547,11 +2570,11 @@ already_AddRefed<gfxTextRun> gfxFontGroup::MakeTextRun(
  template already_AddRefed<gfxTextRun> gfxFontGroup::MakeTextRun(
      const uint8_t* aString, uint32_t aLength, const Parameters* aParams,
      gfx::ShapedTextFlags aFlags, nsTextFrameUtils::Flags aFlags2,
@@ -1040,7 +1040,7 @@ index de9a9661a1..f878bdb36c 100644
  
  // Helper to get a hashtable that maps tags to Script codes, created on first
  // use.
-@@ -2609,8 +2634,9 @@ static Script ResolveScriptForLang(const nsAtom* aLanguage, Script aDefault) {
+@@ -2609,8 +2632,9 @@ static Script ResolveScriptForLang(const nsAtom* aLanguage, Script aDefault) {
    static LangScriptCache sCache;
    static RWLock sLock("LangScriptCache lock");
  
@@ -1052,7 +1052,7 @@ index de9a9661a1..f878bdb36c 100644
  
    {
      // Try to use a cached value without taking an exclusive lock.
-@@ -3045,7 +3071,7 @@ gfxTextRun* gfxFontGroup::GetEllipsisTextRun(
+@@ -3045,7 +3069,7 @@ gfxTextRun* gfxFontGroup::GetEllipsisTextRun(
                         nullptr, 0,       aAppUnitsPerDevPixel};
    mCachedEllipsisTextRun =
        MakeTextRun(ellipsis.BeginReading(), ellipsis.Length(), &params, aFlags,
@@ -1061,7 +1061,7 @@ index de9a9661a1..f878bdb36c 100644
    if (!mCachedEllipsisTextRun) {
      return nullptr;
    }
-@@ -3460,7 +3486,7 @@ already_AddRefed<gfxFont> gfxFontGroup::FindFontForChar(
+@@ -3460,7 +3484,7 @@ already_AddRefed<gfxFont> gfxFontGroup::FindFontForChar(
          font = FindFallbackFaceForChar(ff, aCh, aNextCh, presentation);
          if (font) {
            if (CheckCandidate(font,
