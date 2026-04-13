@@ -3,7 +3,7 @@ new file mode 100644
 index 0000000000..abcdef1234
 --- /dev/null
 +++ b/dom/base/CanvasFingerprintManager.cpp
-@@ -0,0 +1,79 @@
+@@ -0,0 +1,156 @@
 +/* Camoufox: Per-context canvas fingerprint manager */
 +#include "CanvasFingerprintManager.h"
 +
@@ -42,24 +42,101 @@ index 0000000000..abcdef1234
 +  return 0;
 +}
 +
-+void CanvasFingerprintManager::ApplyCanvasNoise(uint8_t* data, uint32_t length,
++// Content-aware + content-dependent canvas noise.
++//
++// Defeats:
++//   - Tier 1 known-pixel checks (DataDome, Castle): flat regions are skipped
++//     because flat_score < FLAT_THRESHOLD. fillRect(R,G,B) is undisturbed.
++//   - WWW'25 Pixel-Recovery Attack (Nguyen & Vadrevu): noise depends on the
++//     pixel content AND its 4 neighbors, not just (seed, index). The delta
++//     measured on a base canvas is not transferable to other canvases.
++//
++// Properties:
++//   - Per-session deterministic (linkability preserved within a session)
++//   - Only modifies pixels at AA edges / textured regions (mimics real GPU
++//     hardware variation, which only differs at anti-aliased edges)
++//   - Format-agnostic: works for RGBA (getImageData) and BGRA (GetImageBuffer)
++//   - Preserves clearRect transparency (zero channels untouched)
++void CanvasFingerprintManager::ApplyCanvasNoise(uint8_t* data, uint32_t width,
++                                                 uint32_t height,
 +                                                 uint32_t seed) {
-+  if (seed == 0 || length == 0 || !data) return;
-+  uint32_t state = seed;
-+  for (uint32_t i = 0; i + 3 < length; i += 4) {
-+    state = (state * 1664525u + 1013904223u);
-+    if (state & 0x100) {
-+      // Iterate RGB channels (skip alpha at i+3) to find first non-zero.
-+      // This is format-agnostic: works for both RGBA (getImageData) and
-+      // BGRA (GetImageBuffer/toDataURL). Skipping zero channels preserves
-+      // clearRect transparency and avoids the CreepJS post-clear trap.
++  if (seed == 0 || !data || width < 3 || height < 3) return;
++
++  // Threshold for "flat region": max channel diff between this pixel and
++  // any of its 4 neighbors. 8 is below visual perception but above smooth
++  // gradients so fillRect / solid backgrounds are safely skipped.
++  constexpr int32_t FLAT_THRESHOLD = 8;
++
++  const uint32_t stride = width * 4;
++
++  // Skip 1px border to avoid bounds checking inside the hot loop.
++  for (uint32_t y = 1; y + 1 < height; y++) {
++    const uint32_t row = y * stride;
++    for (uint32_t x = 1; x + 1 < width; x++) {
++      const uint32_t i = row + x * 4;
++
++      // Fetch this pixel and 4 neighbors (north, south, west, east).
++      const uint8_t* p = &data[i];
++      const uint8_t* pn = &data[i - stride];
++      const uint8_t* ps = &data[i + stride];
++      const uint8_t* pw = &data[i - 4];
++      const uint8_t* pe = &data[i + 4];
++
++      // Compute "flat score": max absolute channel difference vs any neighbor.
++      // If all 4 neighbors are within FLAT_THRESHOLD on every channel, this
++      // pixel is in a flat region (solid color or smooth gradient) and we
++      // leave it alone. This is what makes Tier 1 known-pixel checks pass.
++      int32_t maxDiff = 0;
 +      for (uint32_t c = 0; c < 3; c++) {
-+        int32_t val = static_cast<int32_t>(data[i + c]);
-+        if (val == 0) continue;
-+        data[i + c] = static_cast<uint8_t>(
-+            (state & 0x200) ? std::min(val + 1, 255) : std::max(val - 1, 0));
-+        break;  // Only modify one channel per pixel
++        int32_t v = p[c];
++        int32_t d;
++        d = v - pn[c]; if (d < 0) d = -d; if (d > maxDiff) maxDiff = d;
++        d = v - ps[c]; if (d < 0) d = -d; if (d > maxDiff) maxDiff = d;
++        d = v - pw[c]; if (d < 0) d = -d; if (d > maxDiff) maxDiff = d;
++        d = v - pe[c]; if (d < 0) d = -d; if (d > maxDiff) maxDiff = d;
 +      }
++      if (maxDiff < FLAT_THRESHOLD) continue;
++
++      // Content-dependent hash: mix seed with this pixel's RGB and the RGB
++      // of all 4 neighbors. An attacker cannot predict the perturbation by
++      // measuring a base canvas because the hash inputs differ per pixel
++      // context, defeating the Pixel-Recovery Attack from WWW'25.
++      uint32_t h = seed;
++      h = h * 1664525u + 1013904223u + p[0];
++      h = h * 1664525u + 1013904223u + p[1];
++      h = h * 1664525u + 1013904223u + p[2];
++      h = h * 1664525u + 1013904223u + pn[0];
++      h = h * 1664525u + 1013904223u + pn[1];
++      h = h * 1664525u + 1013904223u + pn[2];
++      h = h * 1664525u + 1013904223u + ps[0];
++      h = h * 1664525u + 1013904223u + ps[1];
++      h = h * 1664525u + 1013904223u + ps[2];
++      h = h * 1664525u + 1013904223u + pw[0];
++      h = h * 1664525u + 1013904223u + pw[1];
++      h = h * 1664525u + 1013904223u + pw[2];
++      h = h * 1664525u + 1013904223u + pe[0];
++      h = h * 1664525u + 1013904223u + pe[1];
++      h = h * 1664525u + 1013904223u + pe[2];
++
++      // Only perturb ~50% of edge pixels (still enough to alter the hash).
++      if (!(h & 0x100)) continue;
++
++      // Pick which channel to modify (R, G, or B). Skip channel if zero
++      // (preserves clearRect transparency and avoids underflow).
++      uint32_t channel = (h >> 9) % 3;
++      int32_t val = data[i + channel];
++      if (val == 0) {
++        // Try next non-zero channel
++        for (uint32_t k = 1; k <= 2; k++) {
++          uint32_t c2 = (channel + k) % 3;
++          if (data[i + c2] != 0) { channel = c2; val = data[i + c2]; break; }
++        }
++        if (val == 0) continue;
++      }
++
++      // Direction: ±1 from another bit of the hash.
++      data[i + channel] = static_cast<uint8_t>(
++          (h & 0x200) ? std::min(val + 1, 255) : std::max(val - 1, 0));
 +    }
 +  }
 +}
@@ -88,7 +165,7 @@ new file mode 100644
 index 0000000000..bcdef12345
 --- /dev/null
 +++ b/dom/base/CanvasFingerprintManager.h
-@@ -0,0 +1,27 @@
+@@ -0,0 +1,28 @@
 +/* Camoufox: Per-context canvas fingerprint manager */
 +#ifndef mozilla_dom_CanvasFingerprintManager_h
 +#define mozilla_dom_CanvasFingerprintManager_h
@@ -105,7 +182,8 @@ index 0000000000..bcdef12345
 + public:
 +  static void SetSeed(uint32_t aUserContextId, uint32_t aSeed);
 +  static uint32_t GetSeed(uint32_t aUserContextId);
-+  static void ApplyCanvasNoise(uint8_t* data, uint32_t length, uint32_t seed);
++  static void ApplyCanvasNoise(uint8_t* data, uint32_t width, uint32_t height,
++                                uint32_t seed);
 +  static void DisableFunction(uint32_t aId);
 +  static bool IsFunctionEnabledForWebIDL(JSContext* aCx, JSObject* aObj);
 + private:
@@ -211,7 +289,7 @@ index xxxxxxxxxx..yyyyyyyyyy 100644
  #include "mozilla/dom/CanvasGradient.h"
  #include "mozilla/dom/CanvasPath.h"
  #include "mozilla/dom/CanvasPattern.h"
-@@ -2287,5 +2289,34 @@
+@@ -2287,5 +2289,33 @@
          SurfaceFormat::A8R8G8B8_UINT32);
    }
 
@@ -239,14 +317,13 @@ index xxxxxxxxxx..yyyyyyyyyy 100644
 +    uint32_t canvasSeed = CanvasFingerprintManager::GetSeed(userContextId);
 +    if (canvasSeed != 0) {
 +      CanvasFingerprintManager::ApplyCanvasNoise(
-+          ret.get(), out_imageSize->width * out_imageSize->height * 4,
-+          canvasSeed);
++          ret.get(), out_imageSize->width, out_imageSize->height, canvasSeed);
 +    }
 +  }
 +
    return ret;
  }
-@@ -6615,5 +6644,37 @@
+@@ -6615,5 +6644,38 @@
    } while (false);
 
 +  // Per-context canvas fingerprint noise
@@ -276,8 +353,9 @@ index xxxxxxxxxx..yyyyyyyyyy 100644
 +      bool isShared2;
 +      uint8_t* pixelData =
 +          JS_GetUint8ClampedArrayData(darray, &isShared2, nogc2);
-+      CanvasFingerprintManager::ApplyCanvasNoise(pixelData, len.value(),
-+                                                  canvasSeed);
++      // GetImageDataArray params: aWidth/aHeight are the requested rect.
++      CanvasFingerprintManager::ApplyCanvasNoise(
++          pixelData, aWidth, aHeight, canvasSeed);
 +    }
 +  }
 +
