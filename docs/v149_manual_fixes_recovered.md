@@ -2246,3 +2246,44 @@ print("A17 applied")
 **All hunks recovered.** No remaining "unknown" gaps in the webgl-spoofing
 patch reconciliation. The other webgl-spoofing hunks (#1-6, #9-12) apply
 cleanly via `patch -p1` with fuzz.
+
+---
+
+# Non-critical rejects (safe to ignore on FF149)
+
+Three `.rej` files remain after patch.py runs. All three are safely
+ignorable on FF149 — they do NOT block the build and do NOT affect any
+feature we use:
+
+## `toolkit/xre/nsXREDirProvider.cpp.rej`
+
+From `patches/librewolf/*` — adds `XRE_MOZ_SYS_NATIVE_MANIFESTS` and
+`XRE_MOZ_USER_NATIVE_MANIFESTS` LibreWolf-specific path handlers for
+native-messaging manifests. We don't use native messaging, so these
+don't matter. **Skip.**
+
+## `browser/components/preferences/main.js.rej`
+
+Removes `alwaysCheckDefault` / `isDefaultPane` / `isNotDefaultPane`
+preferences UI entries (the "Set Camoufox as default browser" button).
+We never show Firefox preferences UI to a user. **Skip.**
+
+## `browser/app/Makefile.in.rej`
+
+Tries to rename `EXTRA_DEPS += firefox.exe.manifest` to
+`camoufox.exe.manifest`. In FF149, the manifest reference has moved
+to `browser/app/moz.build` (line 10), so the Makefile.in hunk no longer
+matches anything. The build output keeps using `firefox.exe.manifest`
+and `firefox.exe`, which are renamed to `camoufox.*` by the post-build
+packaging step (see section 17 "Post-build packaging steps"). **Skip.**
+
+---
+
+_All three of these .rej files can be deleted after patch.py runs:_
+
+```bash
+cd /app/camoufox-149.0-beta.1
+rm -f toolkit/xre/nsXREDirProvider.cpp.rej
+rm -f browser/components/preferences/main.js.rej
+rm -f browser/app/Makefile.in.rej
+```
