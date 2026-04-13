@@ -417,6 +417,13 @@ def generate_profile(
     # 10. Behavioral
     config["humanize"] = True
 
+    # 11. prefers-color-scheme: 50/50 light/dark matches real user population.
+    # 100% dark mode is statistically anomalous and contributes to CreepJS
+    # headlessRating. The leading underscore prevents this field from being
+    # injected into CAMOU_CONFIG (filtered in rdp_api.py); it's applied as
+    # a Firefox pref instead.
+    config["_prefers_color_scheme"] = random.choice(["light", "dark"])
+
     return config
 
 

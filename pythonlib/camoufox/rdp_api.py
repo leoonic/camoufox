@@ -276,6 +276,38 @@ class RDPPage:
         except asyncio.CancelledError:
             pass
 
+    async def simulate_tab_switch(self, duration: Optional[float] = None) -> None:
+        """Simulate the user switching to another tab/window.
+
+        Minimizes the browser window, waits `duration` seconds (5-25 default),
+        then restores it. Produces native window.blur, document.visibilitychange
+        (hidden), rAF throttling, and on restore: focus + visibilitychange (visible).
+        Anti-bot systems (PerimeterX, Shopee SFU, Akamai) track these as a
+        strong signal of human behavior. Real users switch tabs 3-8x per session.
+
+        Call only from idle periods -- do not call during navigation or
+        extraction, since the tab gets throttled while minimized.
+        """
+        import random as _r
+
+        if not self._bridge or not self._bridge.is_connected:
+            return
+
+        if duration is None:
+            duration = _r.uniform(5.0, 25.0)
+
+        try:
+            await self._bridge.send_command("minimizeWindow", {}, timeout=5)
+        except Exception:
+            return
+
+        await asyncio.sleep(duration)
+
+        try:
+            await self._bridge.send_command("restoreWindow", {}, timeout=5)
+        except Exception:
+            pass
+
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
@@ -1328,16 +1360,28 @@ class _Mouse:
             self._x, self._y = path[-1][0], path[-1][1]
 
     async def click(self, x: float, y: float, button: int = 0) -> None:
+        """Click at (x, y) with humanized movement first.
+
+        Always moves the cursor with sigma-lognormal before clicking, so
+        callers cannot accidentally produce a teleport. If the cursor is
+        already at the target (distance < 2px), move_smooth is a no-op.
+        Use click_smooth() for additional hover delay (visual confirmation pause).
+        """
+        dx = x - self._x
+        dy = y - self._y
+        if dx * dx + dy * dy >= 4:  # distance >= 2px
+            await self.move_smooth(x, y)
+
         if (
             self._page._bridge
             and self._page._bridge.is_connected
             and self._page._tab_id is not None
         ):
             await self._page._bridge.send_command(
-                "click", {"tabId": self._page._tab_id, "x": x, "y": y, "button": button}
+                "click", {"tabId": self._page._tab_id, "x": self._x, "y": self._y, "button": button}
             )
         else:
-            await self._page.evaluate(f"document.elementFromPoint({x},{y})?.click()")
+            await self._page.evaluate(f"document.elementFromPoint({self._x},{self._y})?.click()")
 
     async def move(self, x: float, y: float) -> None:
         """Instant move (no animation). Use move_smooth() for human-like."""
@@ -1412,15 +1456,35 @@ class _Keyboard:
     def __init__(self, page: RDPPage):
         self._page = page
 
-    async def type(self, text: str) -> None:
+    async def type(self, text: str, instant: bool = False) -> None:
+        """Type text character-by-character with log-normal inter-key delays.
+
+        Shopee SFU SDK tracks 5 keyboard events with timestamps. Typing the
+        whole string at once produces 0ms inter-key intervals (bot signature).
+        Set instant=True to bypass humanization (for non-detected contexts).
+        """
         if (
-            self._page._bridge
-            and self._page._bridge.is_connected
-            and self._page._tab_id is not None
+            not self._page._bridge
+            or not self._page._bridge.is_connected
+            or self._page._tab_id is None
         ):
+            return
+
+        if instant or not text:
             await self._page._bridge.send_command(
                 "type", {"tabId": self._page._tab_id, "text": text}
             )
+            return
+
+        from camoufox.humanize import typing_sequence
+        for ch, delay in typing_sequence(text):
+            try:
+                await self._page._bridge.send_command(
+                    "type", {"tabId": self._page._tab_id, "text": ch}
+                )
+            except Exception:
+                break
+            await asyncio.sleep(delay)
 
     async def press(self, key: str) -> None:
         if (
@@ -1473,6 +1537,13 @@ class RDPBrowser:
             if not viewport:
                 ow = fingerprint.get("window.outerWidth", 1920)
                 oh = fingerprint.get("window.outerHeight", 1040)
+                dpr = fingerprint.get("window.devicePixelRatio", 1.0)
+                # Firefox --width/--height are physical pixels. With DPR > 1
+                # the CSS viewport = physical / DPR. Multiply by DPR so the
+                # actual CSS viewport matches the spoofed outerWidth/Height.
+                if dpr and dpr > 1.0:
+                    ow = int(ow * dpr)
+                    oh = int(oh * dpr)
                 viewport = {"width": ow, "height": oh}
             if not timezone:
                 timezone = fingerprint.get("timezone")
@@ -1598,6 +1669,10 @@ class RDPBrowser:
             # Tell the extension exactly which WS port to connect to
             # (avoids scanning 8775-8790 which causes multi-instance conflicts).
             "extensions.input.ws_port": self._ws_port,
+            # Fix Bug 1749009: proxy onAuthRequired + blocking breaks iframe
+            # loading (COEP check on 407 response). Captcha iframes behind
+            # authenticated proxies fail with NS_ERROR_DOM_CORP_FAILED.
+            "browser.tabs.remote.useCrossOriginEmbedderPolicy": False,
         }
         if self._proxy:
             parsed = urlparse(
@@ -1623,6 +1698,24 @@ class RDPBrowser:
                 prefs["network.proxy.no_proxies_on"] = "localhost, 127.0.0.1"
         if self._locale:
             prefs["intl.accept_languages"] = self._locale
+
+        # prefers-color-scheme: apply from fingerprint profile (50/50 light/dark
+        # avoids the 100%-dark-mode anomaly in CreepJS headlessRating).
+        # Fallback for legacy profiles without the field: derive deterministically
+        # from canvas:seed so the same profile always gets the same scheme.
+        if self._fingerprint:
+            scheme = self._fingerprint.get("_prefers_color_scheme")
+            if not scheme:
+                canvas_seed = int(self._fingerprint.get("canvas:seed", 0) or 0)
+                scheme = "dark" if (canvas_seed & 1) else "light"
+            # layout.css.prefers-color-scheme.content-override: 1=light, 2=dark
+            if scheme == "dark":
+                prefs["ui.systemUsesDarkTheme"] = 1
+                prefs["layout.css.prefers-color-scheme.content-override"] = 2
+            else:
+                prefs["ui.systemUsesDarkTheme"] = 0
+                prefs["layout.css.prefers-color-scheme.content-override"] = 1
+
         _write_user_prefs(self._profile_path, prefs)
 
         args = [

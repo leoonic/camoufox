@@ -390,6 +390,49 @@ function connect() {
           break;
         }
 
+        case "minimizeWindow": {
+          // Minimize current window. Triggers real window.blur,
+          // document.visibilitychange, visibilityState=hidden, and rAF throttle.
+          // Anti-bot systems (PerimeterX, Shopee SFU) track these events.
+          try {
+            const win = await browser.windows.getCurrent();
+            await browser.windows.update(win.id, { state: "minimized" });
+            result = { ok: true, windowId: win.id };
+          } catch (e) {
+            error = e.message || String(e);
+          }
+          break;
+        }
+
+        case "restoreWindow": {
+          try {
+            const win = await browser.windows.getCurrent();
+            await browser.windows.update(win.id, { state: "normal" });
+            // Focus it too so window.focus fires
+            await browser.windows.update(win.id, { focused: true });
+            result = { ok: true };
+          } catch (e) {
+            error = e.message || String(e);
+          }
+          break;
+        }
+
+        case "closeOtherTabs": {
+          const allTabs = await browser.tabs.query({ currentWindow: true });
+          const keepId = params.keepTabId || null;
+          let closed = 0;
+          for (const t of allTabs) {
+            if (keepId && t.id === keepId) continue;
+            if (t.active && !keepId) continue;
+            try {
+              await browser.tabs.remove(t.id);
+              closed++;
+            } catch (_) {}
+          }
+          result = { ok: true, closed };
+          break;
+        }
+
         case "ping":
           result = { pong: true };
           break;
