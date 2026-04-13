@@ -1,0 +1,38 @@
+--- a/dom/canvas/ClientWebGLContext.cpp
++++ b/dom/canvas/ClientWebGLContext.cpp
+@@ -2605,6 +2605,17 @@
+ 
+         switch (pname) {
+           case dom::WEBGL_debug_renderer_info_Binding::UNMASKED_RENDERER_WEBGL:
++            {
++              nsAutoString stored;
++              if (WebGLParamsManager::GetRenderer(GetUserContextId(), stored)) {
++                ret = Some(NS_ConvertUTF16toUTF8(stored));
++                break;
++              }
++            }
++            if (auto value = MaskConfig::GetString("webGl:renderer")) {
++              ret = Some(value.value());
++              break;
++            }
+             if (ShouldResistFingerprinting(RFPTarget::WebGLRenderInfo) ||
+                 ShouldResistFingerprinting(RFPTarget::WebGLRendererConstant)) {
+               ret = Some("Mozilla"_ns);
+@@ -2617,6 +2628,17 @@
+             break;
+ 
+           case dom::WEBGL_debug_renderer_info_Binding::UNMASKED_VENDOR_WEBGL:
++            {
++              nsAutoString stored;
++              if (WebGLParamsManager::GetVendor(GetUserContextId(), stored)) {
++                ret = Some(NS_ConvertUTF16toUTF8(stored));
++                break;
++              }
++            }
++            if (auto value = MaskConfig::GetString("webGl:vendor")) {
++              ret = Some(value.value());
++              break;
++            }
+             if (ShouldResistFingerprinting(RFPTarget::WebGLRenderInfo)) {
+               ret = Some("Mozilla"_ns);
+             } else if (ShouldResistFingerprinting(

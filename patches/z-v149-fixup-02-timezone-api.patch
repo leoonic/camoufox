@@ -1,0 +1,65 @@
+--- a/js/public/Date.h
++++ b/js/public/Date.h
+@@ -55,6 +55,10 @@
+  */
+ extern JS_PUBLIC_API void ResetTimeZone();
+ 
++extern JS_PUBLIC_API bool SetTimeZoneOverride(const char* timezoneId);
++// Camoufox: per-context timezone override
++extern JS_PUBLIC_API bool SetRealmTimeZoneOverride(JSContext* cx, const char* timezoneId);
++
+ class ClippedTime;
+ inline ClippedTime TimeClip(double time);
+ 
+--- a/js/src/vm/DateTime.cpp
++++ b/js/src/vm/DateTime.cpp
+@@ -286,7 +286,9 @@
+ 
+ js::DateTimeInfo::DateTimeInfo(const char* timezone) : DateTimeInfo() {
+ #if JS_HAS_INTL_API
+-  timeZoneOverride_ = timezone ? std::string(timezone) : std::string();
++  if (timezone && *timezone) {
++    timeZoneOverride_ = RefPtr<JS::TimeZoneString>(new JS::TimeZoneString(timezone));
++  }
+ #endif
+ }
+ 
+@@ -606,8 +608,17 @@
+   js::ResetTimeZoneInternal(js::ResetTimeZoneMode::ResetEvenIfOffsetUnchanged);
+ }
+ 
++JS_PUBLIC_API bool JS::SetTimeZoneOverride(const char* timeZoneId) {
++  if (!timeZoneId) {
++    return false;
++  }
++  _putenv_s("TZ", timeZoneId);
++  js::ResetTimeZoneInternal(js::ResetTimeZoneMode::ResetEvenIfOffsetUnchanged);
++  return true;
++}
++
+ JS_PUBLIC_API bool JS::SetRealmTimeZoneOverride(JSContext* cx, const char* timeZoneId) {
+-  if (!timeZoneId || !mozilla::intl::TimeZone::IsValidTimeZoneId(timeZoneId)) {
++  if (!timeZoneId || !*timeZoneId) {
+     return false;
+   }
+   JS::Realm* realm = js::GetContextRealm(cx);
+--- a/dom/base/Navigator.cpp
++++ b/dom/base/Navigator.cpp
+@@ -9,6 +9,7 @@
+ // Camoufox: per-context + global navigator spoofing
+ #include "NavigatorManager.h"
+ #include "MaskConfig.hpp"
++#include "js/Date.h"
+ #include "nsJSUtils.h"
+ 
+ #include "Geolocation.h"
+@@ -126,7 +127,8 @@
+   if (sInitialized) return;
+   sInitialized = true;
+   if (auto tz = MaskConfig::GetString("timezone")) {
+-    nsJSUtils::SetTimeZoneOverride(tz.value().c_str());
++    _putenv_s("TZ", tz.value().c_str());
++    JS::ResetTimeZone();
+   }
+ }
+ 

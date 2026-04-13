@@ -1,0 +1,53 @@
+--- a/layout/style/GlobalStyleSheetCache.cpp
++++ b/layout/style/GlobalStyleSheetCache.cpp
+@@ -466,7 +466,7 @@
+   if (!Preferences::GetBool(PREF_LEGACY_STYLESHEET_CUSTOMIZATION)) {
+     return;
+   }
+-  if (MaskConfig::GetBool("disableTheming")) {
++  if (MaskConfig::CheckBool("disableTheming")) {
+     return;
+   }
+ 
+--- a/dom/media/webspeech/synth/nsSynthVoiceRegistry.cpp
++++ b/dom/media/webspeech/synth/nsSynthVoiceRegistry.cpp
+@@ -318,7 +318,7 @@
+     return NS_ERROR_NOT_AVAILABLE;
+   }
+ 
+-  if (MaskConfig::GetBool("voices:blockIfNotDefined")) return NS_OK;
++  if (MaskConfig::CheckBool("voices:blockIfNotDefined")) return NS_OK;
+ 
+   return AddVoiceImpl(aService, aUri, aName, aLang, aLocalService,
+                       aQueuesUtterances);
+@@ -802,7 +802,7 @@
+                       NS_ConvertUTF16toUTF8(aVoice->mUri).get());
+         aTask->Init();
+         // If fake completion is disabled, throw an error
+-        if (!MaskConfig::GetBool("voices:fakeCompletion")) {
++        if (!MaskConfig::CheckBool("voices:fakeCompletion")) {
+           aTask->DispatchError(0, 0);
+           return;
+         }
+--- a/dom/media/MediaDevices.cpp
++++ b/dom/media/MediaDevices.cpp
+@@ -346,7 +346,7 @@
+   // Replaces the RFP-based device count spoofing with one that controls the
+   // number of devices exposed.
+ 
+-  if (!MaskConfig::GetBool("mediaDevices:enabled")) {
++  if (!MaskConfig::CheckBool("mediaDevices:enabled")) {
+     return exposed;
+   }
+ 
+--- a/docshell/base/BrowsingContext.cpp
++++ b/docshell/base/BrowsingContext.cpp
+@@ -1835,7 +1835,7 @@
+   }
+ 
+   // Camoufox: Disable remote subframes by default
+-  if (MaskConfig::GetBool("enableRemoteSubframes")) {
++  if (MaskConfig::CheckBool("enableRemoteSubframes")) {
+     mUseRemoteSubframes = aUseRemoteSubframes;
+   }
+   return NS_OK;

@@ -1,0 +1,21 @@
+--- a/dom/workers/WorkerPrivate.h
++++ b/dom/workers/WorkerPrivate.h
+@@ -942,6 +942,7 @@
+   }
+ 
+   nsPIDOMWindowInner* GetAncestorWindow() const;
++  Document* GetDocument() const;
+ 
+   void EvictFromBFCache();
+ 
+--- a/dom/canvas/OffscreenCanvas.h
++++ b/dom/canvas/OffscreenCanvas.h
+@@ -75,6 +75,8 @@
+ 
+   FONT_VISIBILITY_PROVIDER_IMPL
+ 
++  mozilla::dom::Document* GetDocument() const;
++
+   OffscreenCanvas(nsIGlobalObject* aGlobal, uint32_t aWidth, uint32_t aHeight);
+ 
+   OffscreenCanvas(nsIGlobalObject* aGlobal, uint32_t aWidth, uint32_t aHeight,

@@ -1,0 +1,53 @@
+--- a/layout/style/nsMediaFeatures.cpp
++++ b/layout/style/nsMediaFeatures.cpp
+@@ -66,20 +66,15 @@
+     return GetSize(aDocument);
+   }
+ 
+-  // Media queries in documents in an RDM pane should use the simulated
+-  // device size.
+-  Maybe<CSSIntSize> deviceSize =
+-      nsGlobalWindowOuter::GetRDMDeviceSize(aDocument);
+-  if (deviceSize.isSome()) {
+-    return CSSPixel::ToAppUnits(deviceSize.value());
+-  }
+-
+-  // Media queries in documents should use an override set with WebDriver BiDi
+-  // if it exists.
+-  if (dom::BrowsingContext* bc = aDocument.GetBrowsingContext()) {
+-    Maybe<CSSIntSize> screenSize = bc->GetScreenAreaOverride();
+-    if (screenSize.isSome()) {
+-      return CSSPixel::ToAppUnits(screenSize.value());
++  // Camoufox: per-context screen dimensions for CSS device-width/height queries
++  if (nsPIDOMWindowInner* inner = aDocument.GetInnerWindow()) {
++    nsGlobalWindowInner* win = nsGlobalWindowInner::Cast(inner);
++    if (win) {
++      uint32_t ucid = mozilla::dom::ScreenDimensionManager::GetUserContextIdFromWindow(win);
++      int32_t w = 0, h = 0;
++      if (mozilla::dom::ScreenDimensionManager::GetDimensions(ucid, &w, &h)) {
++        return CSSPixel::ToAppUnits(CSSIntSize(w, h));
++      }
+     }
+   }
+ 
+--- a/layout/mathml/nsMathMLChar.cpp
++++ b/layout/mathml/nsMathMLChar.cpp
+@@ -273,7 +273,7 @@
+                "nsUnicodeTable can only access glyphs by code point");
+   return aFontGroup->MakeTextRun(&aGlyph.code, 1, aDrawTarget,
+                                  aAppUnitsPerDevPixel, gfx::ShapedTextFlags(),
+-                                 nsTextFrameUtils::Flags(), nullptr);
++                                 nsTextFrameUtils::Flags(), nullptr, 0); // TODO: Extract private browsing ID
+ }
+ 
+ // An instance of nsOpenTypeTable is associated with one gfxFontEntry that
+--- a/gfx/thebes/gfxPlatformFontList.cpp
++++ b/gfx/thebes/gfxPlatformFontList.cpp
+@@ -460,6 +460,7 @@
+     return mozilla::Nothing();
+   }
+   void UserFontSetUpdated(gfxUserFontEntry*) override {}
++  mozilla::dom::Document* GetDocument() const override { return nullptr; }
+   using FontVisibilityProvider::ReportBlockedFontFamily;
+ 
+  private:

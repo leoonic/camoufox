@@ -1,18 +1,17 @@
 diff --git a/dom/media/webspeech/synth/moz.build b/dom/media/webspeech/synth/moz.build
 --- a/dom/media/webspeech/synth/moz.build
 +++ b/dom/media/webspeech/synth/moz.build
-@@ -63,4 +63,7 @@
+@@ -66,3 +66,6 @@ LOCAL_INCLUDES += [
+     "/dom/base",
      "ipc",
  ]
 +
 +# DOM Mask
 +LOCAL_INCLUDES += ['/camoucfg']
-
 diff --git a/dom/media/webspeech/synth/nsSynthVoiceRegistry.cpp b/dom/media/webspeech/synth/nsSynthVoiceRegistry.cpp
-index e5a1353d6b..4a4a5b080b 100644
 --- a/dom/media/webspeech/synth/nsSynthVoiceRegistry.cpp
 +++ b/dom/media/webspeech/synth/nsSynthVoiceRegistry.cpp
-@@ -26,7 +26,8 @@
+@@ -26,6 +26,7 @@
  #include "nsSpeechTask.h"
  #include "nsString.h"
  
@@ -20,8 +19,7 @@ index e5a1353d6b..4a4a5b080b 100644
  using mozilla::intl::LocaleService;
  
  namespace mozilla::dom {
- 
-@@ -169,6 +171,20 @@
+@@ -169,6 +170,20 @@
        // Start up all speech synth services.
        NS_CreateServicesFromCategory(NS_SPEECH_SYNTH_STARTED, nullptr,
                                      NS_SPEECH_SYNTH_STARTED);
@@ -42,7 +40,7 @@ index e5a1353d6b..4a4a5b080b 100644
      }
    }
  
-@@ -305,6 +320,8 @@ nsSynthVoiceRegistry::AddVoice(nsISpeechService* aService,
+@@ -305,6 +320,8 @@
      return NS_ERROR_NOT_AVAILABLE;
    }
  
@@ -51,7 +49,7 @@ index e5a1353d6b..4a4a5b080b 100644
    return AddVoiceImpl(aService, aUri, aName, aLang, aLocalService,
                        aQueuesUtterances);
  }
-@@ -779,6 +796,35 @@ void nsSynthVoiceRegistry::SpeakImpl(VoiceData* aVoice, nsSpeechTask* aTask,
+@@ -779,6 +796,35 @@
         NS_ConvertUTF16toUTF8(aText).get(),
         NS_ConvertUTF16toUTF8(aVoice->mUri).get(), aRate, aPitch));
  

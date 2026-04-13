@@ -1,0 +1,18 @@
+--- a/toolkit/components/remote/nsRemoteService.cpp
++++ b/toolkit/components/remote/nsRemoteService.cpp
+@@ -190,6 +190,7 @@
+ nsresult nsRemoteService::SendCommandLine(const nsACString& aProfile,
+                                           size_t aArgc, const char** aArgv,
+                                           bool aRaise) {
++  return NS_ERROR_NOT_AVAILABLE;  // Camoufox: multi-instance
+   if (aProfile.IsEmpty()) {
+     return NS_ERROR_FAILURE;
+   }
+@@ -249,6 +250,7 @@
+ }
+ 
+ void nsRemoteService::StartupServer() {
++  return;  // Camoufox: multi-instance
+   if (mRemoteServer) {
+     return;
+   }

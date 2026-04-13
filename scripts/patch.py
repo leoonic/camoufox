@@ -78,15 +78,88 @@ class Patcher:
                 # Track patch failures
                 failed_patches = []
 
+                # Known-safe rejects: hunks that FAIL on FF149 because the
+                # corresponding functionality is added by z-v149-fixup-*.patch
+                # files using different anchors, OR is now native in FF149.
+                # Key: patch filename (basename). Value: set of .rej file paths
+                # (relative to source root) that are safe to ignore.
+                KNOWN_SAFE_REJECTS = {
+                    'audio-fingerprint-manager.patch': {
+                        # z-v149-fixup-01 adds SetAudioFingerprintSeed decl via a
+                        # different anchor in nsGlobalWindowInner.h.
+                        'dom/base/nsGlobalWindowInner.h.rej',
+                    },
+                    'screen-spoofing.patch': {
+                        # z-v149-fixup-01 handles nsGlobalWindowInner.h decls;
+                        # z-v149-fixup-03 handles nsMediaFeatures.cpp.
+                        'dom/base/nsGlobalWindowInner.h.rej',
+                        'layout/style/nsMediaFeatures.cpp.rej',
+                    },
+                    'timezone-spoofing.patch': {
+                        # z-v149-fixup-02 adds timezone externs to Date.h;
+                        # Realm.cpp: FF149 ships native implementation (A16).
+                        'js/src/vm/Realm.cpp.rej',
+                        'js/public/Date.h.rej',
+                    },
+                    'webgl-spoofing.patch': {
+                        # z-v149-fixup-07 adds UNMASKED_RENDERER/VENDOR inserts.
+                        'dom/canvas/ClientWebGLContext.cpp.rej',
+                    },
+                    'geolocation-spoofing.patch': {
+                        # z-v149-fixup-04 handles NetworkGeolocationProvider.
+                        'dom/system/NetworkGeolocationProvider.sys.mjs.rej',
+                    },
+                    'hide-default-browser.patch': {
+                        # Non-critical: removes "set as default" UI we don't use.
+                        'browser/components/preferences/main.js.rej',
+                    },
+                    'mozilla_dirs.patch': {
+                        # Non-critical: LibreWolf-specific native manifest paths
+                        # (XRE_MOZ_SYS_NATIVE_MANIFESTS). We don't use native
+                        # messaging so these path handlers don't matter.
+                        'toolkit/xre/nsXREDirProvider.cpp.rej',
+                    },
+                    'windows-theming-bug-modified.patch': {
+                        # Non-critical: FF149 moved manifest ref from Makefile.in
+                        # to browser/app/moz.build; post-build rename handles it.
+                        'browser/app/Makefile.in.rej',
+                    },
+                    'h2-fingerprint-spoofing.patch': {
+                        # z-v149-fixup-06 adds SETTINGS_TYPE_MAX_HEADER_LIST_SIZE
+                        # via a different anchor in Http2Session.h.
+                        'netwerk/protocol/http/Http2Session.h.rej',
+                    },
+                }
+
+                def _filter_known_safe(patch_file, rejects):
+                    """Remove .rej files that are in KNOWN_SAFE_REJECTS for this
+                    patch. Returns the filtered list of rejects that are still
+                    considered failures."""
+                    basename = os.path.basename(patch_file)
+                    safe = KNOWN_SAFE_REJECTS.get(basename, set())
+                    if not safe:
+                        return rejects
+                    filtered = []
+                    for rej in rejects:
+                        # Normalize: strip leading "./" and use forward slashes
+                        norm = rej.lstrip('./').replace(os.sep, '/')
+                        if norm in safe:
+                            print(f'  [ignored known-safe reject: {norm}]')
+                        else:
+                            filtered.append(rej)
+                    return filtered
+
                 # Apply non-roverfox patches first
                 for patch_file in non_roverfox:
                     rejects = self._apply_and_check(patch_file)
+                    rejects = _filter_known_safe(patch_file, rejects)
                     if rejects:
                         failed_patches.append((patch_file, rejects))
 
                 # Apply roverfox patches last
                 for patch_file in roverfox:
                     rejects = self._apply_and_check(patch_file)
+                    rejects = _filter_known_safe(patch_file, rejects)
                     if rejects:
                         failed_patches.append((patch_file, rejects))
 
@@ -109,13 +182,22 @@ class Patcher:
         Apply a patch and check for reject files.
         Returns list of reject files if any, empty list otherwise.
         """
-        import time
 
         print(f"\n*** -> patch -p1 -i {patch_file}")
         sys.stdout.flush()
 
-        # Record time before applying so we only detect .rej files from this patch
-        start_time = time.time()
+        # Delete any stale .rej files BEFORE running this patch so that any
+        # .rej files found afterwards are guaranteed to be from this patch.
+        # (Using mtime comparison for the same purpose is unreliable on
+        # filesystems with 1-second mtime resolution, where a .rej created
+        # during the same second as start_time appears "older".)
+        for root, dirs, files in os.walk('.'):
+            for file in files:
+                if file.endswith('.rej'):
+                    try:
+                        os.remove(os.path.join(root, file))
+                    except OSError:
+                        pass
 
         # Apply patch interactively - don't capture stdout/stderr at all
         # This allows prompts to show immediately and user can respond
@@ -130,20 +212,22 @@ class Patcher:
             text=True
         )
 
-        # After patch completes, search for any .rej files created during this patch
+        # Collect all .rej files that exist after the patch (guaranteed to
+        # be from this patch since we cleaned before running).
         rejects = []
         for root, dirs, files in os.walk('.'):
             for file in files:
                 if file.endswith('.rej'):
                     reject_path = os.path.join(root, file)
                     if os.path.exists(reject_path):
-                        # Only include if created after this patch started
-                        if os.path.getmtime(reject_path) >= start_time:
-                            rejects.append(reject_path)
+                        rejects.append(reject_path)
 
         # Clean up .rej files so they don't interfere with subsequent patches
         for rej in rejects:
-            os.remove(rej)
+            try:
+                os.remove(rej)
+            except OSError:
+                pass
 
         return rejects
 

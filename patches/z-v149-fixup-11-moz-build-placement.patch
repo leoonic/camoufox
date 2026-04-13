@@ -1,0 +1,10 @@
+--- a/dom/base/moz.build
++++ b/dom/base/moz.build
+@@ -414,6 +414,7 @@
+     "MozQueryInterface.cpp",
+     "MutationObservers.cpp",
+     "Navigator.cpp",
++    "NavigatorManager.cpp",
+     "NodeInfo.cpp",
+     "NodeIterator.cpp",
+     "NodeUbiReporting.cpp",
