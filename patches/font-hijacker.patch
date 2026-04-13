@@ -33,7 +33,7 @@ index 3d99906827..a9d1191688 100644
 +++ b/gfx/thebes/moz.build
 @@ -301,3 +301,6 @@ DEFINES["GRAPHITE2_STATIC"] = True
  CXXFLAGS += ["-Werror=switch"]
-
+ 
  include("/tools/fuzzing/libfuzzer-config.mozbuild")
 +
 +# DOM Mask
@@ -122,9 +122,9 @@ index 70c06609e9..66b2666621 100644
  #include "mozilla/dom/FontFaceBinding.h"
 +#include "MaskConfig.hpp"
  #include "nsTHashSet.h"
-
+ 
  class gfxFontFaceBufferSource;
-
+ 
 @@ -33,6 +34,20 @@
  
  namespace mozilla::dom {

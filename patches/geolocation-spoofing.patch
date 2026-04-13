@@ -85,9 +85,10 @@ diff --git a/dom/system/NetworkGeolocationProvider.sys.mjs b/dom/system/NetworkG
 index 7edc62b4a6..19b77aa6b6 100644
 --- a/dom/system/NetworkGeolocationProvider.sys.mjs
 +++ b/dom/system/NetworkGeolocationProvider.sys.mjs
-@@ -442,17 +442,53 @@ NetworkGeolocationProvider.prototype = {
-     let url = Services.urlFormatter.formatURLPref("geo.provider.network.url");
-     LOG("Sending request");
+@@ -356,17 +356,53 @@ NetworkGeolocationProvider.prototype = {
+     } else {
+       Glean.geolocation.geolocationService.network_ip.add();
+     }
  
 +    // Use CAMOU_CONFIG geolocation if configured
 +    let DEFAULT_DEG = -180;
@@ -103,8 +104,8 @@ index 7edc62b4a6..19b77aa6b6 100644
 +
      let result;
      try {
--      result = await this.makeRequest(url, wifiData);
--      LOG(
+-      result = await this.fetchLocation(url, wifiData);
+-      lazy.log.info(
 -        `geo provider reported: ${result.location.lng}:${result.location.lat}`
 -      );
 -      let newLocation = new NetworkGeoPositionObject(
@@ -134,9 +135,9 @@ index 7edc62b4a6..19b77aa6b6 100644
 +        );
 +      } else {
 +        // No CAMOU_CONFIG override, use real geolocation
-+        result = await this.makeRequest(url, wifiData);
++        result = await this.fetchLocation(url, wifiData);
 +
-+        LOG(
++        lazy.log.info(
 +          `geo provider reported: ${result.location.lng}:${result.location.lat}`
 +        );
 +        newLocation = new NetworkGeoPositionObject(
@@ -148,4 +149,4 @@ index 7edc62b4a6..19b77aa6b6 100644
  
        if (this.listener) {
          this.listener.update(newLocation);
-
+ 

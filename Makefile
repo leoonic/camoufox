@@ -1,12 +1,16 @@
 include upstream.sh
 export
+export MOZBUILD_STATE_PATH ?= $(CURDIR)/.mozbuild
+export TMPDIR ?= $(CURDIR)/.tmp
+export MACH_BUILD_PYTHON_NATIVE_PACKAGE_SOURCE ?= system
+$(shell mkdir -p $(TMPDIR))
 
 cf_source_dir := camoufox-$(version)-$(release)
 ff_source_tarball := firefox-$(version).source.tar.xz
 
-debs := python3 python3-dev python3-pip p7zip-full golang-go msitools wget aria2 libsqlite3-dev
-rpms := python3 python3-devel p7zip golang msitools wget aria2 sqlite-devel
-pacman := python python-pip p7zip go msitools wget aria2 sqlite
+debs := python3 python3-dev python3-pip p7zip-full golang-go msitools wget aria2 libsqlite3-dev libasound2-dev python3-zstandard python3-psutil
+rpms := python3 python3-devel p7zip golang msitools wget aria2 sqlite-devel alsa-lib-devel python3-zstandard python3-psutil
+pacman := python python-pip p7zip go msitools wget aria2 sqlite alsa-lib python-zstandard python-psutil
 
 .PHONY: help fetch setup setup-minimal clean set-target distclean build package \
         build-launcher check-arch revert edits run bootstrap mozbootstrap dir \

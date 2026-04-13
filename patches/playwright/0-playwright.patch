@@ -619,9 +619,9 @@ index cee178c29e..8aeaed0336 100644
  NS_IMETHODIMP
  nsDocShell::GetIsNavigating(bool* aOut) {
    *aOut = mIsNavigating;
-@@ -4803,7 +5047,7 @@ nsDocShell::GetVisibility(bool* aVisibility) {
+@@ -4895,7 +5139,7 @@ nsDocShell::GetVisibility(bool* aVisibility) {
  }
- 
+
  void nsDocShell::ActivenessMaybeChanged() {
 -  const bool isActive = mBrowsingContext->IsActive();
 +  const bool isActive = mForceActiveState || mBrowsingContext->IsActive();
@@ -1022,7 +1022,13 @@ diff --git a/dom/base/nsDOMWindowUtils.cpp b/dom/base/nsDOMWindowUtils.cpp
 index d27975b2a3..d48f4c2285 100644
 --- a/dom/base/nsDOMWindowUtils.cpp
 +++ b/dom/base/nsDOMWindowUtils.cpp
-@@ -710,6 +710,55 @@ nsDOMWindowUtils::GetPresShellId(uint32_t* aPresShellId) {
+@@ -47,4 +47,5 @@
+ #include "mozilla/dom/UserActivation.h"
++#include "mozilla/dom/WindowBinding.h"
+ #include "mozilla/layers/APZCCallbackHelper.h"
+ #include "mozilla/layers/CompositorBridgeChild.h"
+ #include "mozilla/layers/PCompositorBridgeTypes.h"
+@@ -710,6 +711,55 @@ nsDOMWindowUtils::GetPresShellId(uint32_t* aPresShellId) {
    return NS_ERROR_FAILURE;
  }
  
@@ -1520,8 +1526,8 @@ index ce7c11966e..4079c43d9d 100644
 +                         in unsigned long aIdentifier,
 +                         in boolean aDisablePointerEvent);
 +
-   /** Synthesize a touch event. The event types supported are:
-    *    touchstart, touchend, touchmove, and touchcancel
+   /** Synthesize a wheel event for a window. The event types supported is only
+    *  wheel.
     *
 diff --git a/dom/ipc/BrowserChild.cpp b/dom/ipc/BrowserChild.cpp
 index 80158ce3a0..4e7fc3c95d 100644
@@ -1865,19 +1871,21 @@ diff --git a/dom/webidl/Window.webidl b/dom/webidl/Window.webidl
 index 7c509eb87e..632652dace 100644
 --- a/dom/webidl/Window.webidl
 +++ b/dom/webidl/Window.webidl
-@@ -408,6 +408,8 @@ dictionary SynthesizeMouseEventData {
+@@ -413,6 +413,8 @@ dictionary SynthesizeMouseEventData {
    short inputSource = 1;
    // Modifiers pressed, using constants defined as MODIFIER_* in nsIDOMWindowUtils.
    long modifiers = 0;
 +  // Juggler event identifier for tracking events across processes.
 +  unsigned long jugglerEventId = 0;
  };
- 
+
  // Mozilla-specific stuff
-@@ -424,6 +426,8 @@ dictionary SynthesizeMouseEventOptions {
-   // Set this to true to ensure that the event is dispatched to this DOM window
-   // or one of its children.
-   boolean toWindow = false;
+@@ -461,8 +463,10 @@ dictionary SynthesizeEventOptions {
+ dictionary SynthesizeMouseEventOptions : SynthesizeEventOptions {
+   // Indicates whether the event should ignore viewport bounds during dispatch.
+   boolean ignoreRootScrollFrame = false;
+   // Controls WidgetMouseEvent.mReason value.
+   boolean isWidgetEventSynthesized = false;
 +  // Controls whether the mouse event should be converted to a pointer event.
 +  boolean convertToPointer = true;
  };
@@ -2857,14 +2865,15 @@ diff --git a/services/settings/Utils.sys.mjs b/services/settings/Utils.sys.mjs
 index 8cd4afc313..60f5eb6e52 100644
 --- a/services/settings/Utils.sys.mjs
 +++ b/services/settings/Utils.sys.mjs
-@@ -97,7 +97,7 @@ const _cdnURLs = {};
+@@ -99,8 +99,8 @@ const _cdnURLs = {};
  
  export var Utils = {
    get SERVER_URL() {
--    return lazy.allowServerURLOverride
-+    return true || lazy.allowServerURLOverride
-       ? lazy.gServerURL
-       : AppConstants.REMOTE_SETTINGS_SERVER_URL;
+-    return lazy.allowServerURL
++    return true || lazy.allowServerURL
+       ? // eslint-disable-next-line mozilla/valid-lazy
+         lazy.gServerURL
+       : AppConstants.REMOTE_SETTINGS_SERVER_URLS[0];
    },
 @@ -110,6 +110,9 @@ export var Utils = {
    log,
@@ -3592,14 +3601,14 @@ index ef6b603bdb..6cc82fa4a6 100644
      WriteParam(aWriter, aParam.mCallbackId);
  
      // Mark the event as stopped to notify callback.
-@@ -278,6 +279,7 @@ struct ParamTraits<mozilla::WidgetMouseEvent> {
-       aResult->mExitFrom = Some(static_cast<paramType::ExitFrom>(exitFrom));
-     }
-     rv = rv && ReadParam(aReader, &aResult->mClickCount) &&
-+         ReadParam(aReader, &aResult->mJugglerEventId) &&
-          ReadParam(aReader, &aResult->mCallbackId);
-     return rv;
+@@ -315,6 +316,7 @@ struct ParamTraits<mozilla::WidgetMouseEvent> {
+            ReadParam(aReader, &aResult->mContextMenuTrigger) &&
+            ReadParam(aReader, &aResult->mExitFrom) &&
+            ReadParam(aReader, &aResult->mClickCount) &&
++           ReadParam(aReader, &aResult->mJugglerEventId) &&
+            ReadParam(aReader, &aResult->mCallbackId);
    }
+ };
 diff --git a/xpcom/reflect/xptinfo/xptinfo.h b/xpcom/reflect/xptinfo/xptinfo.h
 index 1c0aff31b9..bbac5fa58a 100644
 --- a/xpcom/reflect/xptinfo/xptinfo.h
