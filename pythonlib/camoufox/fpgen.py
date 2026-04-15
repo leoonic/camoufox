@@ -415,7 +415,16 @@ def generate_profile(
     config["mediaDevices:speakers"] = random.choice([1, 1, 2, 2])
 
     # 10. Behavioral
-    config["humanize"] = True
+    # humanize=False: disable Camoufox's native C++ mouse interpolation. We
+    # generate all trajectories in Python via humanize.generate_path (sigma-
+    # lognormal model) and feed them point-by-point to sendNativeMouseEvent.
+    # If the native humanize is ALSO on, it double-interpolates and produces
+    # jittery visible movement.
+    config["humanize"] = False
+    # Disable Camoufox's built-in red cursor-highlighter (from browser-init.patch).
+    # Our extension/cursor.js injects a smaller orange shadow-DOM cursor that is
+    # not detectable from page JavaScript (closed shadow root + pointer-events:none).
+    config["showcursor"] = False
 
     # 11. prefers-color-scheme: 50/50 light/dark matches real user population.
     # 100% dark mode is statistically anomalous and contributes to CreepJS

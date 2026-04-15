@@ -1,3 +1,3 @@
-version=146.0.1
-release=beta.25
+version=149.0
+release=beta.1
 closedsrc_rev=1.0.0
