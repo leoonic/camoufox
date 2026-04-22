@@ -22,6 +22,11 @@ let spyPending = new Map();   // requestId -> partial entry
 let spyResults = [];          // completed {url, method, headers, body, responseBody, timestamp}
 const MAX_SPY = 100;
 
+// --- Observer: content script event buffer ---
+let observerActive = false;
+let observationEvents = [];
+const MAX_OBSERVATIONS = 500;
+
 function setupCaptureListener() {
   // Remove existing listener if any
   if (browser.webRequest.onBeforeRequest.hasListener(onBeforeRequestCapture)) {
@@ -355,14 +360,24 @@ function connect() {
           break;
 
         case "bgFetch": {
-          // Fetch from extension background (bypasses page JS monkey-patches)
+          // Fetch from extension background (bypasses page JS monkey-patches,
+          // not bound to page origin/CSP, uses browser cookie jar).
           const resp = await fetch(params.url, {
             method: params.method || "GET",
             headers: params.headers || {},
-            credentials: "include"  // send cookies
+            credentials: params.credentials || "include",
+            redirect: params.redirect || "follow",
+            cache: params.cache || "no-store",
+            body: params.body || undefined
           });
-          const text = await resp.text();
-          result = { status: resp.status, body: text.substring(0, params.maxBody || 100000) };
+          // opaqueredirect responses have no readable body
+          const text = (resp.type === "opaqueredirect") ? "" : await resp.text();
+          result = {
+            status: resp.status,
+            url: resp.url,
+            type: resp.type,
+            body: text.substring(0, params.maxBody || 200000)
+          };
           break;
         }
 
@@ -433,6 +448,99 @@ function connect() {
           break;
         }
 
+        case "startObserving": {
+          observerActive = true;
+          observationEvents = [];
+          navSessionStart = Date.now();
+          lastNavUrl = "";
+          // Inject observer.js into the specified tab (or active tab)
+          const obsTabId = params.tabId;
+          if (obsTabId) {
+            injectObserver(obsTabId);
+          } else {
+            const activeTabs = await browser.tabs.query({ active: true, currentWindow: true });
+            if (activeTabs.length > 0) injectObserver(activeTabs[0].id);
+          }
+          result = { ok: true };
+          break;
+        }
+
+        case "stopObserving":
+          observerActive = false;
+          result = { ok: true, count: observationEvents.length };
+          break;
+
+        case "getObservations": {
+          const obsSince = params.since || 0;
+          const filtered = observationEvents.filter(e => e.t > obsSince);
+          if (params.clear) observationEvents = [];
+          result = { events: filtered };
+          break;
+        }
+
+        case "getAccessibilityTree": {
+          const atTabId = params.tabId;
+          let targetTab = atTabId;
+          if (!targetTab) {
+            const aTabs = await browser.tabs.query({ active: true, currentWindow: true });
+            if (aTabs.length > 0) targetTab = aTabs[0].id;
+          }
+          if (targetTab) {
+            const treeResult = await browser.tabs.executeScript(targetTab, {
+              code: `(function() {
+                function walk(el, depth) {
+                  if (!el || depth > 8) return [];
+                  var nodes = [];
+                  var tag = el.tagName ? el.tagName.toLowerCase() : "";
+                  if (!tag || tag === "script" || tag === "style" || tag === "noscript") return nodes;
+                  var role = el.getAttribute ? (el.getAttribute("role") || "") : "";
+                  var ariaLabel = el.getAttribute ? (el.getAttribute("aria-label") || "") : "";
+                  var text = "";
+                  for (var i = 0; i < el.childNodes.length; i++) {
+                    if (el.childNodes[i].nodeType === 3) text += el.childNodes[i].textContent;
+                  }
+                  text = text.trim().replace(/\\s+/g, " ").slice(0, 80);
+                  var id = el.id || "";
+                  var cls = el.className && typeof el.className === "string" ? el.className.split(" ").slice(0,3).join(" ") : "";
+                  if (tag === "a" || tag === "button" || tag === "input" || tag === "select" ||
+                      tag === "textarea" || tag === "img" || tag === "h1" || tag === "h2" ||
+                      tag === "h3" || tag === "h4" || tag === "label" || tag === "nav" ||
+                      tag === "main" || tag === "header" || tag === "footer" || tag === "section" ||
+                      tag === "article" || role || ariaLabel || id || text) {
+                    var node = { tag: tag };
+                    if (id) node.id = id;
+                    if (cls) node.cls = cls;
+                    if (role) node.role = role;
+                    if (ariaLabel) node.aria = ariaLabel;
+                    if (text) node.text = text;
+                    if (tag === "a") node.href = (el.getAttribute("href") || "").slice(0, 100);
+                    if (tag === "img") node.alt = (el.getAttribute("alt") || "").slice(0, 80);
+                    if (tag === "input") { node.type = el.type || "text"; node.value = (el.value || "").slice(0, 50); }
+                    nodes.push(node);
+                  }
+                  var children = el.children;
+                  if (children) {
+                    for (var j = 0; j < children.length; j++) {
+                      nodes = nodes.concat(walk(children[j], depth + 1));
+                    }
+                  }
+                  return nodes;
+                }
+                return JSON.stringify(walk(document.body, 0));
+              })()`,
+              runAt: "document_idle"
+            });
+            try {
+              result = { tree: JSON.parse(treeResult[0]) };
+            } catch(_) {
+              result = { tree: treeResult[0] };
+            }
+          } else {
+            result = { tree: [] };
+          }
+          break;
+        }
+
         case "ping":
           result = { pong: true };
           break;
@@ -471,8 +579,176 @@ function injectCursor(tabId) {
 browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === "complete") {
     injectCursor(tabId);
+    if (observerActive) injectObserver(tabId);
   }
 });
+
+// Observer: listen for events from observer.js content script
+browser.runtime.onMessage.addListener((message) => {
+  if (!observerActive) return;
+  if (message && message.type === "obs_event") {
+    observationEvents.push(message.data);
+    if (observationEvents.length > MAX_OBSERVATIONS) {
+      observationEvents = observationEvents.slice(-MAX_OBSERVATIONS);
+    }
+  }
+});
+
+// Navigation tracking via webNavigation API (no polling)
+var navSessionStart = 0;
+var lastNavUrl = "";
+
+function pushNavEvent(data) {
+  if (!observerActive) return;
+  if (data.url === lastNavUrl) return; // deduplicate
+  lastNavUrl = data.url;
+  observationEvents.push(data);
+  if (observationEvents.length > MAX_OBSERVATIONS) {
+    observationEvents = observationEvents.slice(-MAX_OBSERVATIONS);
+  }
+}
+
+// Full page navigation completed
+browser.webNavigation.onCompleted.addListener((details) => {
+  if (details.frameId !== 0) return;
+  browser.tabs.get(details.tabId).then((tab) => {
+    var isRedirect = details.transitionQualifiers &&
+      (details.transitionQualifiers.includes("server_redirect") ||
+       details.transitionQualifiers.includes("client_redirect"));
+    pushNavEvent({
+      t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
+      type: "page_load",
+      url: details.url,
+      title: tab.title || "",
+      transition: details.transitionType || "",
+      redirect: !!isRedirect
+    });
+  }).catch(() => {});
+}, { url: [{ schemes: ["http", "https"] }] });
+
+// SPA navigation (pushState / replaceState)
+browser.webNavigation.onHistoryStateUpdated.addListener((details) => {
+  if (details.frameId !== 0) return;
+  browser.tabs.get(details.tabId).then((tab) => {
+    pushNavEvent({
+      t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
+      type: "spa_navigation",
+      url: details.url,
+      title: tab.title || ""
+    });
+  }).catch(() => {});
+}, { url: [{ schemes: ["http", "https"] }] });
+
+// Link opened in new tab (ctrl+click, target=_blank, window.open)
+browser.webNavigation.onCreatedNavigationTarget.addListener((details) => {
+  pushNavEvent({
+    t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
+    type: "new_tab",
+    url: details.url,
+    title: "",
+    sourceTabId: details.sourceTabId
+  });
+});
+
+// Hash fragment changes (#section)
+browser.webNavigation.onReferenceFragmentUpdated.addListener((details) => {
+  if (details.frameId !== 0) return;
+  browser.tabs.get(details.tabId).then((tab) => {
+    pushNavEvent({
+      t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
+      type: "hash_navigation",
+      url: details.url,
+      title: tab.title || ""
+    });
+  }).catch(() => {});
+}, { url: [{ schemes: ["http", "https"] }] });
+
+// Tab switch: user changed active tab
+browser.tabs.onActivated.addListener((activeInfo) => {
+  if (!observerActive) return;
+  browser.tabs.get(activeInfo.tabId).then((tab) => {
+    pushNavEvent({
+      t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
+      type: "tab_switch",
+      url: tab.url || "",
+      title: tab.title || "",
+      tabId: activeInfo.tabId
+    });
+    // Re-inject observer into newly focused tab
+    injectObserver(activeInfo.tabId);
+  }).catch(() => {});
+});
+
+// Tab lifecycle
+browser.tabs.onCreated.addListener((tab) => {
+  if (!observerActive) return;
+  pushNavEvent({
+    t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
+    type: "tab_created",
+    url: tab.url || "",
+    title: tab.title || "",
+    tabId: tab.id
+  });
+});
+
+browser.tabs.onRemoved.addListener((tabId, removeInfo) => {
+  if (!observerActive) return;
+  pushNavEvent({
+    t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
+    type: "tab_closed",
+    url: "",
+    title: "",
+    tabId: tabId,
+    windowClosing: removeInfo.isWindowClosing
+  });
+});
+
+// Window focus: detect when user leaves/returns to browser
+browser.windows.onFocusChanged.addListener((windowId) => {
+  if (!observerActive) return;
+  var left = windowId === browser.windows.WINDOW_ID_NONE;
+  pushNavEvent({
+    t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
+    type: left ? "browser_blur" : "browser_focus",
+    url: "",
+    title: "",
+    windowId: windowId
+  });
+});
+
+// Idle detection: user inactive / screen locked
+browser.idle.setDetectionInterval(30); // 30 seconds threshold
+browser.idle.onStateChanged.addListener((newState) => {
+  if (!observerActive) return;
+  pushNavEvent({
+    t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
+    type: "idle_state",
+    url: "",
+    title: "",
+    state: newState // "active", "idle", "locked"
+  });
+});
+
+// Downloads
+browser.downloads.onCreated.addListener((downloadItem) => {
+  if (!observerActive) return;
+  pushNavEvent({
+    t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
+    type: "download",
+    url: downloadItem.url || "",
+    title: downloadItem.filename || "",
+    fileSize: downloadItem.fileSize || 0,
+    mime: downloadItem.mime || ""
+  });
+});
+
+function injectObserver(tabId) {
+  browser.tabs.executeScript(tabId, {
+    file: "observer.js",
+    runAt: "document_idle",
+    allFrames: false
+  }).catch(() => {});
+}
 
 // Init: find port then connect
 initPort().then(() => {

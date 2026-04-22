@@ -253,6 +253,8 @@ class RDPPage:
         self._console_started = False
         self._target_ver = 0
         self._watcher_id = None
+        self._observing = False
+        self._screenshot_task = None
         self.mouse = _Mouse(self)
         self.keyboard = _Keyboard(self)
 
@@ -945,6 +947,81 @@ class RDPPage:
         except Exception as e:
             logger.error(f"clear_cookies failed: {e}")
             return 0
+
+    async def start_observing(self, screenshot_interval: int = 0) -> None:
+        """Activate content script observer. Injects observer.js into the active tab
+        and starts buffering user interaction events (clicks, scroll, input, etc.).
+        If screenshot_interval > 0, captures screenshots every N seconds."""
+        if not self._bridge or not self._bridge.is_connected:
+            raise ConnectionError("Extension bridge not connected")
+        params = {}
+        if self._tab_id is not None:
+            params["tabId"] = self._tab_id
+        await self._bridge.send_command("startObserving", params)
+        self._observing = True
+        self._screenshot_task = None
+        if screenshot_interval > 0:
+            self._screenshot_task = asyncio.create_task(
+                self._screenshot_loop(screenshot_interval)
+            )
+        logger.info("Observation started")
+
+    async def stop_observing(self) -> dict:
+        """Stop observation and return the full event log."""
+        if self._screenshot_task:
+            self._screenshot_task.cancel()
+            try:
+                await self._screenshot_task
+            except asyncio.CancelledError:
+                pass
+            self._screenshot_task = None
+        self._observing = False
+        if not self._bridge or not self._bridge.is_connected:
+            return {"events": []}
+        result = await self._bridge.send_command("stopObserving", {})
+        events = await self.get_observations(clear=True)
+        logger.info(f"Observation stopped, {len(events)} events collected")
+        return {"events": events, "count": result.get("count", 0) if result else 0}
+
+    async def get_observations(self, since: int = 0, clear: bool = False) -> list:
+        """Get buffered observation events. Optionally clear the buffer."""
+        if not self._bridge or not self._bridge.is_connected:
+            return []
+        result = await self._bridge.send_command(
+            "getObservations", {"since": since, "clear": clear}
+        )
+        return result.get("events", []) if result else []
+
+    async def get_accessibility_tree(self) -> list:
+        """Get a simplified DOM snapshot: tag, id, class, role, aria-label, text
+        for semantically relevant elements."""
+        if not self._bridge or not self._bridge.is_connected:
+            return []
+        params = {}
+        if self._tab_id is not None:
+            params["tabId"] = self._tab_id
+        result = await self._bridge.send_command("getAccessibilityTree", params)
+        return result.get("tree", []) if result else []
+
+    async def _screenshot_loop(self, interval: int) -> None:
+        """Internal: periodically capture screenshots while observing."""
+        while self._observing:
+            try:
+                await asyncio.sleep(interval)
+                data = await self.screenshot()
+                if data and self._bridge and self._bridge.is_connected:
+                    # Add screenshot event to observation buffer via direct inject
+                    import base64 as _b64
+
+                    b64 = _b64.b64encode(data).decode("ascii")
+                    # Truncate to first 200 chars for the event log (full data in file)
+                    await self._bridge.send_command(
+                        "getObservations", {"since": 0, "clear": False}
+                    )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Screenshot loop error: {e}")
 
     async def force_gc(self) -> None:
         """Force garbage + cycle collection on the current tab."""

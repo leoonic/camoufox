@@ -26,7 +26,10 @@
     "webRequest",
     "webRequestBlocking",
     "proxy",
-    "cookies"
+    "cookies",
+    "webNavigation",
+    "idle",
+    "downloads"
   ],
   "background": {
     "scripts": ["background.js"],
