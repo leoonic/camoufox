@@ -32,7 +32,7 @@ this.nativeInput = class extends ExtensionAPI {
             button: opts.button || 0,
             buttons: opts.buttons || 0,
             clickCount: opts.clickCount || 0,
-            modifiers: 0,
+            modifiers: opts.modifiers || 0,
             pressure: (type === "mousedown" || type === "mouseup") ? 0.5 : 0.0,
             inputSource: 1,
           },
@@ -57,11 +57,11 @@ this.nativeInput = class extends ExtensionAPI {
 
     return {
       nativeInput: {
-        async click(tabId, x, y, button = 0) {
+        async click(tabId, x, y, button = 0, modifiers = 0) {
           const browser = getBrowserForTab(tabId);
-          dispatchMouse(browser, "mousemove", x, y);
-          dispatchMouse(browser, "mousedown", x, y, { button, buttons: 1, clickCount: 1 });
-          dispatchMouse(browser, "mouseup", x, y, { button, buttons: 0, clickCount: 1 });
+          dispatchMouse(browser, "mousemove", x, y, { modifiers });
+          dispatchMouse(browser, "mousedown", x, y, { button, buttons: 1, clickCount: 1, modifiers });
+          dispatchMouse(browser, "mouseup", x, y, { button, buttons: 0, clickCount: 1, modifiers });
         },
 
         async moveTo(tabId, x, y) {

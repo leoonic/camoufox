@@ -259,22 +259,34 @@ class RDPPage:
         self.keyboard = _Keyboard(self)
 
     async def _idle_mouse_loop(self):
-        """Subtle micro-movements while waiting, mimicking human idle behavior."""
+        """Humanized micro-drift while waiting on navigation.
+
+        Uses humanize.idle_mouse_drift (sigma-lognormal sub-movements +
+        2-5Hz tremor) instead of teleporting between random points. This
+        matches what real readers do while a page loads and keeps the SFU
+        ring buffer filled with plausible deltas.
+
+        Generates drift in 3-6s chunks so asyncio cancellation is honored
+        within at most one sub-step (~100-300ms).
+        """
         import random as _r
+        from .humanize import idle_mouse_drift
 
         try:
             while True:
-                await asyncio.sleep(_r.uniform(0.4, 1.5))
-                dx = _r.gauss(0, 15)
-                dy = _r.gauss(0, 10)
-                nx = max(50, min(self.mouse._x + dx, 1800))
-                ny = max(50, min(self.mouse._y + dy, 900))
-                try:
-                    await self.mouse._raw_move(nx, ny)
-                    self.mouse._x = nx
-                    self.mouse._y = ny
-                except Exception:
-                    pass
+                cx, cy = self.mouse._x, self.mouse._y
+                chunk = _r.uniform(3.0, 6.0)
+                path = idle_mouse_drift(
+                    cx, cy, chunk, viewport_w=1400, viewport_h=800
+                )
+                for x, y, delay in path:
+                    try:
+                        await self.mouse._raw_move(x, y)
+                        self.mouse._x = x
+                        self.mouse._y = y
+                    except Exception:
+                        pass
+                    await asyncio.sleep(delay)
         except asyncio.CancelledError:
             pass
 
@@ -372,6 +384,55 @@ class RDPPage:
             self._browsing_context_id = target.get(
                 "browsingContextID", self._browsing_context_id
             )
+
+    def _rebind_to_active_sync(self) -> bool:
+        """Re-bind RDP actors a la tab actualmente SELECCIONADA en el browser.
+
+        Multi-tab: tras activar otra tab (incluida una que abrio el sitio con
+        window.open), esto reapunta console/target/browsingContext a esa tab para
+        que evaluate()/content() lean la tab correcta. La parte de input (bridge)
+        usa _tab_id, refrescado aparte via getActiveTab.
+        """
+        root = RootActor(self._client)
+        desc = None
+        try:
+            desc = root.current_tab()
+        except Exception:
+            desc = None
+        if not (isinstance(desc, dict) and desc.get("actor")):
+            tabs = root.list_tabs()
+            desc = tabs[0] if tabs else None
+        if not (isinstance(desc, dict) and desc.get("actor")):
+            return False
+        self._tab_actor_id = desc.get("actor", self._tab_actor_id)
+        tab = TabActor(self._client, self._tab_actor_id)
+        target = tab.get_target()
+        if isinstance(target, dict):
+            self._target_actor_id = target.get("actor", self._target_actor_id)
+            self._console_actor_id = target.get("consoleActor", self._console_actor_id)
+            self._browsing_context_id = target.get(
+                "browsingContextID", self._browsing_context_id
+            )
+            self._console_started = False
+        return True
+
+    async def rebind_to_active(self) -> bool:
+        """Async: re-bind a la tab activa + refrescar _tab_id (bridge) + watcher."""
+        ok = await asyncio.to_thread(self._rebind_to_active_sync)
+        if self._bridge and self._bridge.is_connected:
+            try:
+                r = await self._bridge.send_command("getActiveTab", {}, timeout=3)
+                if r:
+                    self._tab_id = r.get("tabId")
+                    if r.get("url"):
+                        self._url = r["url"]
+            except Exception:
+                pass
+        try:
+            await asyncio.to_thread(self._start_persistent_watcher)
+        except Exception:
+            pass
+        return ok
 
     def _ensure_console(self):
         if not self._console_started:
@@ -984,13 +1045,18 @@ class RDPPage:
         return {"events": events, "count": result.get("count", 0) if result else 0}
 
     async def get_observations(self, since: int = 0, clear: bool = False) -> list:
-        """Get buffered observation events. Optionally clear the buffer."""
+        """Get buffered observation events, sorted chronologically by `t`.
+        Events come from two sources (content script + background) so insertion
+        order is not always chronological. Sorting here gives the consumer a
+        single, ordered timeline."""
         if not self._bridge or not self._bridge.is_connected:
             return []
         result = await self._bridge.send_command(
             "getObservations", {"since": since, "clear": clear}
         )
-        return result.get("events", []) if result else []
+        events = result.get("events", []) if result else []
+        events.sort(key=lambda e: e.get("t", 0))
+        return events
 
     async def get_accessibility_tree(self) -> list:
         """Get a simplified DOM snapshot: tag, id, class, role, aria-label, text
@@ -1436,7 +1502,7 @@ class _Mouse:
         if path:
             self._x, self._y = path[-1][0], path[-1][1]
 
-    async def click(self, x: float, y: float, button: int = 0) -> None:
+    async def click(self, x: float, y: float, button: int = 0, modifiers: int = 0) -> None:
         """Click at (x, y) with humanized movement first.
 
         Always moves the cursor with sigma-lognormal before clicking, so
@@ -1455,7 +1521,8 @@ class _Mouse:
             and self._page._tab_id is not None
         ):
             await self._page._bridge.send_command(
-                "click", {"tabId": self._page._tab_id, "x": self._x, "y": self._y, "button": button}
+                "click", {"tabId": self._page._tab_id, "x": self._x, "y": self._y,
+                          "button": button, "modifiers": modifiers}
             )
         else:
             await self._page.evaluate(f"document.elementFromPoint({self._x},{self._y})?.click()")
@@ -1471,12 +1538,13 @@ class _Mouse:
         await self._follow_path(path)
 
     async def click_smooth(
-        self, x: float, y: float, button: int = 0, target_width: float = 50.0
+        self, x: float, y: float, button: int = 0, target_width: float = 50.0, modifiers: int = 0
     ) -> None:
-        """Human-like: move to target, hover delay, click."""
+        """Human-like: move to target, hover delay, click. `modifiers` = bitmask
+        nsIDOMWindowUtils (Ctrl=0x0008) para ej. abrir link en background sin perder foco."""
         await self.move_smooth(x, y, target_width)
         await asyncio.sleep(_hover_delay())
-        await self.click(self._x, self._y, button)
+        await self.click(self._x, self._y, button, modifiers)
 
     async def down(self, x: float, y: float, button: int = 0) -> None:
         if (
@@ -1606,8 +1674,13 @@ class RDPBrowser:
         profile_path: Optional[str] = None,
         extension_dir: str = EXTENSION_DIR,
         fingerprint: Optional[Dict[str, Any]] = None,
+        allow_addon_newtab: bool = False,
     ):
         self._fingerprint = fingerprint
+        # Camoufox bloquea browser.tabs.create por default (patch disable-extension-newtab,
+        # gateado por camouGetBool('allowAddonNewtab')). Habilitarlo es chrome-level, NO
+        # observable por la pagina -> no afecta anti-deteccion. Necesario para multi-tab.
+        self._allow_addon_newtab = allow_addon_newtab
 
         # Derive viewport, timezone, locale from fingerprint if not explicit
         if fingerprint:
@@ -1812,23 +1885,23 @@ class RDPBrowser:
         await self._bridge.start()
 
         env = os.environ.copy()
+        # Config CAMOU unificado: fingerprint (sin _meta) + timezone + flags.
+        config: Dict[str, Any] = {}
         if self._fingerprint:
-            # Full fingerprint config: strip _meta, chunk for Windows env var limit
-            fp_config = {
+            config = {
                 k: v for k, v in self._fingerprint.items() if not k.startswith("_")
             }
-            config_str = json.dumps(fp_config)
+        if self._timezone:
+            env["TZ"] = self._timezone
+            config.setdefault("timezone", self._timezone)
+        if self._allow_addon_newtab:
+            config["allowAddonNewtab"] = True
+        if config:
+            config_str = json.dumps(config)
             chunk_size = 2047
             for i in range(0, len(config_str), chunk_size):
                 chunk = config_str[i : i + chunk_size]
                 env[f"CAMOU_CONFIG_{(i // chunk_size) + 1}"] = chunk
-            if self._timezone:
-                env["TZ"] = self._timezone
-        elif self._timezone:
-            env["TZ"] = self._timezone
-            config = {"timezone": self._timezone}
-            config_str = json.dumps(config)
-            env["CAMOU_CONFIG_1"] = config_str
 
         logger.info(f"Launching Camoufox RDP on port {self._rdp_port}")
         self._proc = subprocess.Popen(args, env=env)
@@ -1982,6 +2055,51 @@ class RDPBrowser:
             await asyncio.sleep(1)
 
         raise RuntimeError("No tabs available after waiting")
+
+    # ── Multi-tab real (via WebExtension browser.tabs) ────────────────────────
+
+    async def list_tabs(self) -> List[Dict]:
+        """Todas las tabs reales del browser (incluidas las de window.open).
+
+        Usa la WebExtension (autoritativa, trae tabId). Fallback a RootActor RDP.
+        """
+        if self._bridge and self._bridge.is_connected:
+            try:
+                r = await self._bridge.send_command("listTabs", {}, timeout=5)
+                if r and "tabs" in r:
+                    return r["tabs"]
+            except Exception:
+                pass
+
+        def _rdp():
+            root = RootActor(self._client)
+            out = []
+            for t in (root.list_tabs() or []):
+                out.append({
+                    "tabId": t.get("browserId"),
+                    "url": t.get("url"),
+                    "title": t.get("title"),
+                    "active": bool(t.get("selected")),
+                })
+            return out
+
+        return await asyncio.to_thread(_rdp)
+
+    async def create_tab(self, url: Optional[str] = None, active: bool = True) -> Dict:
+        """Abre una tab NUEVA de verdad (browser.tabs.create). Devuelve {tabId,url,index}."""
+        if not (self._bridge and self._bridge.is_connected):
+            raise ConnectionError("Extension bridge not connected, cannot create tab")
+        return await self._bridge.send_command(
+            "createTab", {"url": url or "about:blank", "active": active}, timeout=15
+        ) or {}
+
+    async def activate_tab(self, tab_id: int) -> None:
+        if self._bridge and self._bridge.is_connected:
+            await self._bridge.send_command("activateTab", {"tabId": tab_id}, timeout=5)
+
+    async def close_tab(self, tab_id: int) -> None:
+        if self._bridge and self._bridge.is_connected:
+            await self._bridge.send_command("closeTab", {"tabId": tab_id}, timeout=5)
 
     async def close(self) -> None:
         if self._bridge:

@@ -26,6 +26,111 @@ const MAX_SPY = 100;
 let observerActive = false;
 let observationEvents = [];
 const MAX_OBSERVATIONS = 500;
+const SPA_SNAPSHOT_DELAY = 800;  // ms after SPA nav to let new content render
+const HASH_SNAPSHOT_DELAY = 200;
+
+// Tree walker injected into pages. Skips tracking IDs, hidden elements, and
+// non-semantic subtrees so the snapshot stays small enough for an LLM.
+const TREE_WALKER_CODE = `(function() {
+  var TRACKING_RE = /^(bat[Bb]eacon|criteo|_hj|tm-remote-storage|gtm-|google_ads|fbq|hotjar|sift|optimizely|segment-|onetrust|adroll|gtag|_ga|amzn-)/;
+  var SKIP_TAGS = { script:1, style:1, noscript:1, iframe:1, svg:1, link:1, meta:1, template:1 };
+
+  function isHidden(el) {
+    if (!el || el.nodeType !== 1) return true;
+    if (el.hasAttribute("hidden")) return true;
+    if (el.getAttribute("aria-hidden") === "true") return true;
+    var st;
+    try { st = window.getComputedStyle(el); } catch (_) { return false; }
+    if (!st) return false;
+    if (st.display === "none" || st.visibility === "hidden" || st.opacity === "0") return true;
+    return false;
+  }
+
+  function walk(el, depth) {
+    if (!el || depth > 10) return [];
+    var tag = el.tagName ? el.tagName.toLowerCase() : "";
+    if (!tag || SKIP_TAGS[tag]) return [];
+    if (isHidden(el)) return [];
+
+    var id = el.id || "";
+    if (id && TRACKING_RE.test(id)) return [];
+
+    var role = el.getAttribute ? (el.getAttribute("role") || "") : "";
+    var ariaLabel = el.getAttribute ? (el.getAttribute("aria-label") || "") : "";
+    var text = "";
+    for (var i = 0; i < el.childNodes.length; i++) {
+      if (el.childNodes[i].nodeType === 3) text += el.childNodes[i].textContent;
+    }
+    text = text.trim().replace(/\\s+/g, " ").slice(0, 80);
+
+    var cls = "";
+    if (el.className && typeof el.className === "string") {
+      cls = el.className.split(" ").slice(0, 3).join(" ");
+    }
+
+    var isEmptyLazy = (id === "lazy-component" && !text && el.children.length === 0);
+
+    var include = !isEmptyLazy && (
+      tag === "a" || tag === "button" || tag === "input" || tag === "select" ||
+      tag === "textarea" || tag === "img" || tag === "h1" || tag === "h2" ||
+      tag === "h3" || tag === "h4" || tag === "label" || tag === "nav" ||
+      tag === "main" || tag === "header" || tag === "footer" || tag === "section" ||
+      tag === "article" || role || ariaLabel || (id && !TRACKING_RE.test(id)) || text
+    );
+
+    var nodes = [];
+    if (include) {
+      var node = { tag: tag };
+      if (id) node.id = id;
+      if (cls) node.cls = cls;
+      if (role) node.role = role;
+      if (ariaLabel) node.aria = ariaLabel;
+      if (text) node.text = text;
+      if (tag === "a") node.href = (el.getAttribute("href") || "").slice(0, 100);
+      if (tag === "img") node.alt = (el.getAttribute("alt") || "").slice(0, 80);
+      if (tag === "input") { node.type = el.type || "text"; node.value = (el.value || "").slice(0, 50); }
+      nodes.push(node);
+    }
+
+    var children = el.children;
+    if (children) {
+      for (var j = 0; j < children.length; j++) {
+        nodes = nodes.concat(walk(children[j], depth + 1));
+      }
+    }
+    return nodes;
+  }
+
+  return JSON.stringify(walk(document.body, 0));
+})()`;
+
+function captureTreeSnapshot(tabId, delayMs) {
+  if (!observerActive || !tabId) return;
+  setTimeout(function() {
+    if (!observerActive) return;
+    browser.tabs.executeScript(tabId, {
+      code: TREE_WALKER_CODE,
+      runAt: "document_idle"
+    }).then(function(treeResult) {
+      if (!observerActive) return;
+      var tree;
+      try { tree = JSON.parse(treeResult[0]); } catch (_) { tree = []; }
+      browser.tabs.get(tabId).then(function(tab) {
+        observationEvents.push({
+          t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
+          type: "dom_snapshot",
+          url: tab.url || "",
+          title: tab.title || "",
+          tree: tree,
+          node_count: tree.length
+        });
+        if (observationEvents.length > MAX_OBSERVATIONS) {
+          observationEvents = observationEvents.slice(-MAX_OBSERVATIONS);
+        }
+      }).catch(function() {});
+    }).catch(function() {});
+  }, delayMs || 0);
+}
 
 function setupCaptureListener() {
   // Remove existing listener if any
@@ -239,7 +344,7 @@ function connect() {
       switch (cmd) {
         case "click":
           await browser.nativeInput.click(
-            params.tabId, params.x, params.y, params.button || 0
+            params.tabId, params.x, params.y, params.button || 0, params.modifiers || 0
           );
           result = { ok: true };
           break;
@@ -283,6 +388,41 @@ function connect() {
         case "getActiveTab": {
           const tabs = await browser.tabs.query({ active: true, currentWindow: true });
           result = tabs.length > 0 ? { tabId: tabs[0].id, url: tabs[0].url } : null;
+          break;
+        }
+
+        case "listTabs": {
+          // Todas las tabs de la ventana actual, incluidas las que abrio el sitio
+          // con window.open (que el wrapper RDP no trackea). Ordenadas por indice.
+          const tabs = await browser.tabs.query({ currentWindow: true });
+          tabs.sort((a, b) => a.index - b.index);
+          result = {
+            tabs: tabs.map(t => ({
+              tabId: t.id, url: t.url, title: t.title,
+              active: t.active, index: t.index,
+            })),
+          };
+          break;
+        }
+
+        case "createTab": {
+          const t = await browser.tabs.create({
+            url: params.url || "about:blank",
+            active: params.active !== false,
+          });
+          result = { tabId: t.id, url: t.url, index: t.index };
+          break;
+        }
+
+        case "activateTab": {
+          await browser.tabs.update(params.tabId, { active: true });
+          result = { ok: true, tabId: params.tabId };
+          break;
+        }
+
+        case "closeTab": {
+          await browser.tabs.remove(params.tabId);
+          result = { ok: true };
           break;
         }
 
@@ -432,6 +572,19 @@ function connect() {
           break;
         }
 
+        case "maximizeWindow": {
+          // Maximize via WebExtensions API. Funciona para tablas anchas tipo
+          // matcheador donde el viewport default no muestra todas las columnas.
+          try {
+            const win = await browser.windows.getCurrent();
+            await browser.windows.update(win.id, { state: "maximized", focused: true });
+            result = { ok: true, windowId: win.id };
+          } catch (e) {
+            error = e.message || String(e);
+          }
+          break;
+        }
+
         case "closeOtherTabs": {
           const allTabs = await browser.tabs.query({ currentWindow: true });
           const keepId = params.keepTabId || null;
@@ -453,13 +606,17 @@ function connect() {
           observationEvents = [];
           navSessionStart = Date.now();
           lastNavUrl = "";
-          // Inject observer.js into the specified tab (or active tab)
-          const obsTabId = params.tabId;
-          if (obsTabId) {
-            injectObserver(obsTabId);
-          } else {
+          // Inject observer.js into the specified tab (or active tab) and
+          // capture an initial DOM snapshot so the timeline starts with the
+          // page as it is at start_observing time.
+          let initialTabId = params.tabId;
+          if (!initialTabId) {
             const activeTabs = await browser.tabs.query({ active: true, currentWindow: true });
-            if (activeTabs.length > 0) injectObserver(activeTabs[0].id);
+            if (activeTabs.length > 0) initialTabId = activeTabs[0].id;
+          }
+          if (initialTabId) {
+            injectObserver(initialTabId);
+            captureTreeSnapshot(initialTabId, 100);
           }
           result = { ok: true };
           break;
@@ -487,47 +644,7 @@ function connect() {
           }
           if (targetTab) {
             const treeResult = await browser.tabs.executeScript(targetTab, {
-              code: `(function() {
-                function walk(el, depth) {
-                  if (!el || depth > 8) return [];
-                  var nodes = [];
-                  var tag = el.tagName ? el.tagName.toLowerCase() : "";
-                  if (!tag || tag === "script" || tag === "style" || tag === "noscript") return nodes;
-                  var role = el.getAttribute ? (el.getAttribute("role") || "") : "";
-                  var ariaLabel = el.getAttribute ? (el.getAttribute("aria-label") || "") : "";
-                  var text = "";
-                  for (var i = 0; i < el.childNodes.length; i++) {
-                    if (el.childNodes[i].nodeType === 3) text += el.childNodes[i].textContent;
-                  }
-                  text = text.trim().replace(/\\s+/g, " ").slice(0, 80);
-                  var id = el.id || "";
-                  var cls = el.className && typeof el.className === "string" ? el.className.split(" ").slice(0,3).join(" ") : "";
-                  if (tag === "a" || tag === "button" || tag === "input" || tag === "select" ||
-                      tag === "textarea" || tag === "img" || tag === "h1" || tag === "h2" ||
-                      tag === "h3" || tag === "h4" || tag === "label" || tag === "nav" ||
-                      tag === "main" || tag === "header" || tag === "footer" || tag === "section" ||
-                      tag === "article" || role || ariaLabel || id || text) {
-                    var node = { tag: tag };
-                    if (id) node.id = id;
-                    if (cls) node.cls = cls;
-                    if (role) node.role = role;
-                    if (ariaLabel) node.aria = ariaLabel;
-                    if (text) node.text = text;
-                    if (tag === "a") node.href = (el.getAttribute("href") || "").slice(0, 100);
-                    if (tag === "img") node.alt = (el.getAttribute("alt") || "").slice(0, 80);
-                    if (tag === "input") { node.type = el.type || "text"; node.value = (el.value || "").slice(0, 50); }
-                    nodes.push(node);
-                  }
-                  var children = el.children;
-                  if (children) {
-                    for (var j = 0; j < children.length; j++) {
-                      nodes = nodes.concat(walk(children[j], depth + 1));
-                    }
-                  }
-                  return nodes;
-                }
-                return JSON.stringify(walk(document.body, 0));
-              })()`,
+              code: TREE_WALKER_CODE,
               runAt: "document_idle"
             });
             try {
@@ -583,11 +700,20 @@ browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
   }
 });
 
-// Observer: listen for events from observer.js content script
+// Observer: listen for events from observer.js content script.
+// observer.js sends wallclock (Date.now()); we convert to t relative to
+// navSessionStart so all events (page + navigation) share one timeline.
 browser.runtime.onMessage.addListener((message) => {
   if (!observerActive) return;
   if (message && message.type === "obs_event") {
-    observationEvents.push(message.data);
+    var d = message.data;
+    if (typeof d.wallclock === "number") {
+      d.t = navSessionStart > 0 ? Math.max(0, d.wallclock - navSessionStart) : 0;
+      delete d.wallclock;
+    } else if (typeof d.t !== "number") {
+      d.t = navSessionStart > 0 ? Date.now() - navSessionStart : 0;
+    }
+    observationEvents.push(d);
     if (observationEvents.length > MAX_OBSERVATIONS) {
       observationEvents = observationEvents.slice(-MAX_OBSERVATIONS);
     }
@@ -599,13 +725,14 @@ var navSessionStart = 0;
 var lastNavUrl = "";
 
 function pushNavEvent(data) {
-  if (!observerActive) return;
-  if (data.url === lastNavUrl) return; // deduplicate
-  lastNavUrl = data.url;
+  if (!observerActive) return false;
+  if (data.url && data.url === lastNavUrl) return false; // deduplicate
+  if (data.url) lastNavUrl = data.url;
   observationEvents.push(data);
   if (observationEvents.length > MAX_OBSERVATIONS) {
     observationEvents = observationEvents.slice(-MAX_OBSERVATIONS);
   }
+  return true;
 }
 
 // Full page navigation completed
@@ -615,7 +742,7 @@ browser.webNavigation.onCompleted.addListener((details) => {
     var isRedirect = details.transitionQualifiers &&
       (details.transitionQualifiers.includes("server_redirect") ||
        details.transitionQualifiers.includes("client_redirect"));
-    pushNavEvent({
+    var pushed = pushNavEvent({
       t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
       type: "page_load",
       url: details.url,
@@ -623,6 +750,7 @@ browser.webNavigation.onCompleted.addListener((details) => {
       transition: details.transitionType || "",
       redirect: !!isRedirect
     });
+    if (pushed) captureTreeSnapshot(details.tabId, 0);
   }).catch(() => {});
 }, { url: [{ schemes: ["http", "https"] }] });
 
@@ -630,12 +758,13 @@ browser.webNavigation.onCompleted.addListener((details) => {
 browser.webNavigation.onHistoryStateUpdated.addListener((details) => {
   if (details.frameId !== 0) return;
   browser.tabs.get(details.tabId).then((tab) => {
-    pushNavEvent({
+    var pushed = pushNavEvent({
       t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
       type: "spa_navigation",
       url: details.url,
       title: tab.title || ""
     });
+    if (pushed) captureTreeSnapshot(details.tabId, SPA_SNAPSHOT_DELAY);
   }).catch(() => {});
 }, { url: [{ schemes: ["http", "https"] }] });
 
@@ -654,12 +783,13 @@ browser.webNavigation.onCreatedNavigationTarget.addListener((details) => {
 browser.webNavigation.onReferenceFragmentUpdated.addListener((details) => {
   if (details.frameId !== 0) return;
   browser.tabs.get(details.tabId).then((tab) => {
-    pushNavEvent({
+    var pushed = pushNavEvent({
       t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
       type: "hash_navigation",
       url: details.url,
       title: tab.title || ""
     });
+    if (pushed) captureTreeSnapshot(details.tabId, HASH_SNAPSHOT_DELAY);
   }).catch(() => {});
 }, { url: [{ schemes: ["http", "https"] }] });
 
@@ -667,13 +797,14 @@ browser.webNavigation.onReferenceFragmentUpdated.addListener((details) => {
 browser.tabs.onActivated.addListener((activeInfo) => {
   if (!observerActive) return;
   browser.tabs.get(activeInfo.tabId).then((tab) => {
-    pushNavEvent({
+    var pushed = pushNavEvent({
       t: navSessionStart > 0 ? Date.now() - navSessionStart : 0,
       type: "tab_switch",
       url: tab.url || "",
       title: tab.title || "",
       tabId: activeInfo.tabId
     });
+    if (pushed) captureTreeSnapshot(activeInfo.tabId, 0);
     // Re-inject observer into newly focused tab
     injectObserver(activeInfo.tabId);
   }).catch(() => {});

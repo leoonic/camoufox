@@ -10,7 +10,8 @@
           {"name": "tabId", "type": "integer"},
           {"name": "x", "type": "number"},
           {"name": "y", "type": "number"},
-          {"name": "button", "type": "integer", "optional": true}
+          {"name": "button", "type": "integer", "optional": true},
+          {"name": "modifiers", "type": "integer", "optional": true}
         ]
       },
       {
